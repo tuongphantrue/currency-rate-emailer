@@ -1,0 +1,32 @@
+name: Send Currency Rate
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   
+  workflow_dispatch: {}    # lets you trigger it manually from the Actions tab
+
+jobs:
+  send-currency-rate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate email
+        env:
+          ALERT_THRESHOLD_PERCENT: ""   # set e.g. "1.5" to only email on big moves
+        run: python currency_rate_emailer.py generate
+
+      - name: Send email
+        env:
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          CURRENCY_RECIPIENT: ${{ secrets.CURRENCY_RECIPIENT }}
+        run: python currency_rate_emailer.py send
