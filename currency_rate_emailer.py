@@ -1,11 +1,15 @@
 """
 currency_rate_emailer.py
 
-Fetches exchange rates for a watchlist of currencies -> VND and emails a summary.
-Designed to run on GitHub Actions (see .github/workflows/send-currency-rate.yml)
-or locally via cron. No local computer needs to stay on.
+Fetches exchange rates for a watchlist of currencies -> VND, from two sources,
+and emails a summary. Designed to run on GitHub Actions (see
+.github/workflows/send-currency-rate.yml) or locally via cron. No local
+computer needs to stay on.
 
-Data source: https://www.exchangerate-api.com/ (open.er-api.com, free, no key needed)
+Data sources:
+  1. Market mid-rate: https://www.exchangerate-api.com/ (open.er-api.com, free, no key)
+  2. Vietcombank official buy/sell rates: https://www.vietcombank.com.vn/ (public JSON endpoint,
+     the same data shown on https://www.vietcombank.com.vn/en-us/personal/support/exchange-rates)
 
 Usage:
     python currency_rate_emailer.py generate   # fetch rates, build email body -> email_body.txt
@@ -36,7 +40,13 @@ import requests
 DEFAULT_WATCHLIST = ["USD", "EUR", "JPY", "CNY", "KRW", "GBP", "SGD", "AUD"]
 WATCHLIST = os.environ.get("WATCHLIST", ",".join(DEFAULT_WATCHLIST)).split(",")
 
-API_URL = "https://open.er-api.com/v6/latest/VND"  # base=VND -> we invert to VND-per-unit
+MARKET_API_URL = "https://open.er-api.com/v6/latest/VND"  # base=VND -> we invert to VND-per-unit
+VCB_API_URL = "https://www.vietcombank.com.vn/api/exchangerates"  # official VCB buy/sell, already in VND
+
+SOURCES = [
+    ("Market mid-rate", "https://www.exchangerate-api.com/"),
+    ("Vietcombank official rate", "https://www.vietcombank.com.vn/en-us/personal/support/exchange-rates"),
+]
 
 EMAIL_BODY_FILE = "email_body.txt"
 STATE_FILE = "last_rates.json"
@@ -54,14 +64,14 @@ SMTP_PORT = 587
 
 # --- Fetch ----------------------------------------------------------------
 
-def fetch_rates():
-    """Returns {currency_code: VND_per_unit}."""
-    resp = requests.get(API_URL, timeout=15)
+def fetch_market_rates():
+    """Returns {currency_code: VND_per_unit} from the market mid-rate API."""
+    resp = requests.get(MARKET_API_URL, timeout=15)
     resp.raise_for_status()
     data = resp.json()
 
     if data.get("result") != "success":
-        raise RuntimeError(f"API error: {data}")
+        raise RuntimeError(f"Market API error: {data}")
 
     vnd_to_x = data["rates"]  # base is VND, e.g. {"USD": 0.0000398, ...}
     rates = {}
@@ -70,6 +80,29 @@ def fetch_rates():
         rate = vnd_to_x.get(code)
         if rate:
             rates[code] = 1 / rate  # invert -> VND per 1 unit of `code`
+    return rates
+
+
+def fetch_vcb_rates():
+    """Returns {currency_code: {"buy": VND, "sell": VND}} from Vietcombank's public feed.
+    Rates are already denominated in VND, no inversion needed. If a currency isn't
+    in VCB's list, it's simply omitted (falls back to market-only in the email).
+    """
+    resp = requests.get(VCB_API_URL, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+
+    rates = {}
+    for row in data.get("Data", []):
+        code = row.get("currencyCode")
+        if code and code.strip() in [c.strip() for c in WATCHLIST]:
+            try:
+                buy = float(row.get("transfer") or row.get("cash") or 0)
+                sell = float(row.get("sell") or 0)
+            except ValueError:
+                continue
+            if buy or sell:
+                rates[code] = {"buy": buy, "sell": sell}
     return rates
 
 
@@ -100,11 +133,12 @@ def should_send(rates, previous_rates):
 
 # --- Formatting -------------------------------------------------------------
 
-def format_email_body(rates, previous_rates):
+def format_email_body(rates, vcb_rates, previous_rates):
     lines = [f"Exchange rates to VND - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"]
+
+    lines.append("Market mid-rate")
     lines.append(f"{'Currency':<10}{'1 unit = VND':<18}{'Change'}")
     lines.append("-" * 38)
-
     for code, rate in rates.items():
         change_str = ""
         if previous_rates and code in previous_rates:
@@ -113,6 +147,22 @@ def format_email_body(rates, previous_rates):
             arrow = "UP" if pct > 0 else ("DOWN" if pct < 0 else "FLAT")
             change_str = f"{arrow} {pct:+.2f}%"
         lines.append(f"{code:<10}{rate:,.2f}{'':<6}{change_str}")
+
+    if vcb_rates:
+        lines.append("")
+        lines.append("Vietcombank official rate")
+        lines.append(f"{'Currency':<10}{'Buy (VND)':<16}{'Sell (VND)'}")
+        lines.append("-" * 38)
+        for code in rates:
+            if code in vcb_rates:
+                buy = vcb_rates[code]["buy"]
+                sell = vcb_rates[code]["sell"]
+                lines.append(f"{code:<10}{buy:,.2f}{'':<4}{sell:,.2f}")
+
+    lines.append("")
+    lines.append("Sources:")
+    for name, url in SOURCES:
+        lines.append(f"  {name}: {url}")
 
     return "\n".join(lines)
 
@@ -134,16 +184,21 @@ def send_email(body):
 # --- Commands -----------------------------------------------------------------
 
 def cmd_generate():
-    rates = fetch_rates()
+    rates = fetch_market_rates()
     previous_rates = load_previous_rates()
 
     if not should_send(rates, previous_rates):
         print("No significant change, skipping email.")
-        # Write an empty marker so `send` knows to skip
         open(EMAIL_BODY_FILE, "w").close()
         return
 
-    body = format_email_body(rates, previous_rates)
+    try:
+        vcb_rates = fetch_vcb_rates()
+    except Exception as e:
+        print(f"Vietcombank source failed ({e}), continuing with market rate only.")
+        vcb_rates = {}
+
+    body = format_email_body(rates, vcb_rates, previous_rates)
     with open(EMAIL_BODY_FILE, "w") as f:
         f.write(body)
 
