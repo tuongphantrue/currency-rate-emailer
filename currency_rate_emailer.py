@@ -60,11 +60,25 @@ FAWAZ_FALLBACK_URL = "https://latest.currency-api.pages.dev/v1/currencies/vnd.js
 # always USD regardless of the `base` query param, so we compute cross-rates ourselves.
 FUN_API_URL = "https://api.exchangerate.fun/latest"
 
+# fxratesapi.com: free, no key needed for the latest-rates endpoint (per their docs/npm wrapper).
+FXRATES_API_URL = "https://api.fxratesapi.com/latest"
+
+# Sent with every request. Several of these hosts block the bare default
+# "python-requests/x.y" User-Agent, so we look like an ordinary browser instead.
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+}
+
 SOURCES = [
     ("Market mid-rate", "https://www.exchangerate-api.com/"),
     ("Vietcombank official rate", "https://www.vietcombank.com.vn/en-us/personal/support/exchange-rates"),
     ("fawazahmed0/currency-api", "https://github.com/fawazahmed0/currency-api"),
     ("exchangerate.fun", "https://www.exchangerate.fun/"),
+    ("fxratesapi.com", "https://fxratesapi.com/"),
 ]
 
 EMAIL_BODY_FILE = "email_body.txt"
@@ -85,7 +99,7 @@ SMTP_PORT = 587
 
 def fetch_market_rates():
     """Returns {currency_code: VND_per_unit} from the market mid-rate API."""
-    resp = requests.get(MARKET_API_URL, timeout=15)
+    resp = requests.get(MARKET_API_URL, headers=HEADERS, timeout=15)
     resp.raise_for_status()
     data = resp.json()
 
@@ -107,8 +121,7 @@ def fetch_vcb_rates():
     Rates are already denominated in VND, no inversion needed. If a currency isn't
     in VCB's list, it's simply omitted (falls back to market-only in the email).
     """
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; currency-rate-emailer/1.0)"}
-    resp = requests.get(VCB_API_URL, headers=headers, timeout=15)
+    resp = requests.get(VCB_API_URL, headers=HEADERS, timeout=15)
     resp.raise_for_status()
     data = resp.json()
 
@@ -134,7 +147,7 @@ def fetch_fawaz_rates():
     last_error = None
     for url in (FAWAZ_PRIMARY_URL, FAWAZ_FALLBACK_URL):
         try:
-            resp = requests.get(url, timeout=15)
+            resp = requests.get(url, headers=HEADERS, timeout=15)
             resp.raise_for_status()
             data = resp.json()
             vnd_to_x = data["vnd"]  # e.g. {"usd": 0.0000398, ...}
@@ -160,7 +173,7 @@ def fetch_fun_rates():
     The API always responds with base=USD regardless of the `base` param requested,
     so we compute the VND cross-rate ourselves: VND per 1 X = rates[VND] / rates[X].
     """
-    resp = requests.get(FUN_API_URL, timeout=15)
+    resp = requests.get(FUN_API_URL, headers=HEADERS, timeout=15)
     resp.raise_for_status()
     data = resp.json()
 
@@ -178,6 +191,30 @@ def fetch_fun_rates():
         usd_per_code = usd_to_x.get(code)
         if usd_per_code:
             rates[code] = vnd_per_usd / usd_per_code
+    return rates
+
+
+def fetch_fxrates_rates():
+    """Returns {currency_code: VND_per_unit} from fxratesapi.com (base=VND, no key needed)."""
+    params = {
+        "base": "VND",
+        "currencies": ",".join(c.strip() for c in WATCHLIST),
+        "format": "json",
+    }
+    resp = requests.get(FXRATES_API_URL, headers=HEADERS, params=params, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+
+    if not data.get("success"):
+        raise RuntimeError(f"fxratesapi.com error: {data}")
+
+    vnd_to_x = data["rates"]  # base is VND, e.g. {"USD": 0.0000398, ...}
+    rates = {}
+    for code in WATCHLIST:
+        code = code.strip()
+        rate = vnd_to_x.get(code)
+        if rate:
+            rates[code] = 1 / rate  # invert -> VND per 1 unit of `code`
     return rates
 
 
@@ -208,8 +245,8 @@ def should_send(rates, previous_rates):
 
 # --- Formatting -------------------------------------------------------------
 
-def format_email_body(rates, vcb_rates, fawaz_rates, fun_rates, previous_rates,
-                       vcb_error=None, fawaz_error=None, fun_error=None):
+def format_email_body(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, previous_rates,
+                       vcb_error=None, fawaz_error=None, fun_error=None, fxrates_error=None):
     lines = [f"Exchange rates to VND - {now_vn().strftime('%Y-%m-%d %H:%M')}\n"]
 
     lines.append("Market mid-rate")
@@ -266,6 +303,19 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fun_rates, previous_rates,
     elif fun_error:
         lines.append("")
         lines.append(f"exchangerate.fun: unavailable this run ({fun_error})")
+
+    if fxrates_rates:
+        lines.append("")
+        lines.append("fxratesapi.com (independent aggregator)")
+        lines.append(f"{'Currency':<10}{'1 unit = VND'}")
+        lines.append("-" * 38)
+        for code in rates:
+            if code in fxrates_rates:
+                lines.append(f"{code:<10}{fxrates_rates[code]:,.2f}")
+        used_sources.append(SOURCES[4])
+    elif fxrates_error:
+        lines.append("")
+        lines.append(f"fxratesapi.com: unavailable this run ({fxrates_error})")
 
     lines.append("")
     lines.append("Sources:")
@@ -324,8 +374,16 @@ def cmd_generate():
         fun_rates = {}
         fun_error = str(e)
 
-    body = format_email_body(rates, vcb_rates, fawaz_rates, fun_rates, previous_rates,
-                              vcb_error, fawaz_error, fun_error)
+    try:
+        fxrates_rates = fetch_fxrates_rates()
+        fxrates_error = None
+    except Exception as e:
+        print(f"fxratesapi.com source failed ({e}), continuing without it.")
+        fxrates_rates = {}
+        fxrates_error = str(e)
+
+    body = format_email_body(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, previous_rates,
+                              vcb_error, fawaz_error, fun_error, fxrates_error)
     with open(EMAIL_BODY_FILE, "w") as f:
         f.write(body)
 
