@@ -171,7 +171,7 @@ def format_email_body(rates, vcb_rates, previous_rates):
 
 def send_email(body):
     msg = MIMEText(body)
-    msg["Subject"] = "Daily Exchange Rates -> VND"
+    msg["Subject"] = f"Daily Exchange Rates -> VND - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
     msg["From"] = GMAIL_ADDRESS
     msg["To"] = CURRENCY_RECIPIENT
 
