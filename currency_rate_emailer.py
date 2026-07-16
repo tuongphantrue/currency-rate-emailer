@@ -31,11 +31,19 @@ import sys
 import json
 import smtplib
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from email.mime.text import MIMEText
 
 import requests
 
 # --- Config -------------------------------------------------------------
+
+VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+
+def now_vn():
+    """Current time in Vietnam (UTC+7), regardless of the runner's local timezone."""
+    return datetime.now(VN_TZ)
+
 
 DEFAULT_WATCHLIST = ["USD", "EUR", "JPY", "CNY", "KRW", "GBP", "SGD", "AUD"]
 WATCHLIST = os.environ.get("WATCHLIST", ",".join(DEFAULT_WATCHLIST)).split(",")
@@ -134,7 +142,7 @@ def should_send(rates, previous_rates):
 # --- Formatting -------------------------------------------------------------
 
 def format_email_body(rates, vcb_rates, previous_rates):
-    lines = [f"Exchange rates to VND - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"]
+    lines = [f"Exchange rates to VND - {now_vn().strftime('%Y-%m-%d %H:%M')}\n"]
 
     lines.append("Market mid-rate")
     lines.append(f"{'Currency':<10}{'1 unit = VND':<18}{'Change'}")
@@ -171,7 +179,7 @@ def format_email_body(rates, vcb_rates, previous_rates):
 
 def send_email(body):
     msg = MIMEText(body)
-    msg["Subject"] = f"Daily Exchange Rates -> VND - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    msg["Subject"] = f"Daily Exchange Rates -> VND - {now_vn().strftime('%Y-%m-%d %H:%M')}"
     msg["From"] = GMAIL_ADDRESS
     msg["To"] = CURRENCY_RECIPIENT
 
