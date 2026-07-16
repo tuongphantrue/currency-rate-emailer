@@ -96,7 +96,8 @@ def fetch_vcb_rates():
     Rates are already denominated in VND, no inversion needed. If a currency isn't
     in VCB's list, it's simply omitted (falls back to market-only in the email).
     """
-    resp = requests.get(VCB_API_URL, timeout=15)
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; currency-rate-emailer/1.0)"}
+    resp = requests.get(VCB_API_URL, headers=headers, timeout=15)
     resp.raise_for_status()
     data = resp.json()
 
@@ -141,7 +142,7 @@ def should_send(rates, previous_rates):
 
 # --- Formatting -------------------------------------------------------------
 
-def format_email_body(rates, vcb_rates, previous_rates):
+def format_email_body(rates, vcb_rates, previous_rates, vcb_error=None):
     lines = [f"Exchange rates to VND - {now_vn().strftime('%Y-%m-%d %H:%M')}\n"]
 
     lines.append("Market mid-rate")
@@ -156,6 +157,8 @@ def format_email_body(rates, vcb_rates, previous_rates):
             change_str = f"{arrow} {pct:+.2f}%"
         lines.append(f"{code:<10}{rate:,.2f}{'':<6}{change_str}")
 
+    used_sources = [SOURCES[0]]  # market mid-rate always used if we got this far
+
     if vcb_rates:
         lines.append("")
         lines.append("Vietcombank official rate")
@@ -166,10 +169,14 @@ def format_email_body(rates, vcb_rates, previous_rates):
                 buy = vcb_rates[code]["buy"]
                 sell = vcb_rates[code]["sell"]
                 lines.append(f"{code:<10}{buy:,.2f}{'':<4}{sell:,.2f}")
+        used_sources.append(SOURCES[1])
+    elif vcb_error:
+        lines.append("")
+        lines.append(f"Vietcombank official rate: unavailable this run ({vcb_error})")
 
     lines.append("")
     lines.append("Sources:")
-    for name, url in SOURCES:
+    for name, url in used_sources:
         lines.append(f"  {name}: {url}")
 
     return "\n".join(lines)
@@ -202,11 +209,13 @@ def cmd_generate():
 
     try:
         vcb_rates = fetch_vcb_rates()
+        vcb_error = None
     except Exception as e:
         print(f"Vietcombank source failed ({e}), continuing with market rate only.")
         vcb_rates = {}
+        vcb_error = str(e)
 
-    body = format_email_body(rates, vcb_rates, previous_rates)
+    body = format_email_body(rates, vcb_rates, previous_rates, vcb_error)
     with open(EMAIL_BODY_FILE, "w") as f:
         f.write(body)
 
