@@ -51,9 +51,15 @@ WATCHLIST = os.environ.get("WATCHLIST", ",".join(DEFAULT_WATCHLIST)).split(",")
 MARKET_API_URL = "https://open.er-api.com/v6/latest/VND"  # base=VND -> we invert to VND-per-unit
 VCB_API_URL = "https://www.vietcombank.com.vn/api/exchangerates"  # official VCB buy/sell, already in VND
 
+# fawazahmed0/currency-api: free, no key, independent aggregator, mirrored on two CDNs
+# so a fallback is available if the primary CDN has a hiccup.
+FAWAZ_PRIMARY_URL = "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/vnd.json"
+FAWAZ_FALLBACK_URL = "https://latest.currency-api.pages.dev/v1/currencies/vnd.json"
+
 SOURCES = [
     ("Market mid-rate", "https://www.exchangerate-api.com/"),
     ("Vietcombank official rate", "https://www.vietcombank.com.vn/en-us/personal/support/exchange-rates"),
+    ("fawazahmed0/currency-api", "https://github.com/fawazahmed0/currency-api"),
 ]
 
 EMAIL_BODY_FILE = "email_body.txt"
@@ -115,6 +121,35 @@ def fetch_vcb_rates():
     return rates
 
 
+def fetch_fawaz_rates():
+    """Returns {currency_code: VND_per_unit} from fawazahmed0/currency-api (base=VND).
+    Tries the jsDelivr CDN first, falls back to the pages.dev mirror if that fails.
+    """
+    vnd_to_x = None
+    last_error = None
+    for url in (FAWAZ_PRIMARY_URL, FAWAZ_FALLBACK_URL):
+        try:
+            resp = requests.get(url, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            vnd_to_x = data["vnd"]  # e.g. {"usd": 0.0000398, ...}
+            break
+        except Exception as e:
+            last_error = e
+            continue
+
+    if vnd_to_x is None:
+        raise RuntimeError(f"Both fawazahmed0 endpoints failed: {last_error}")
+
+    rates = {}
+    for code in WATCHLIST:
+        code = code.strip()
+        rate = vnd_to_x.get(code.lower())
+        if rate:
+            rates[code] = 1 / rate  # invert -> VND per 1 unit of `code`
+    return rates
+
+
 # --- State (for % change + threshold) --------------------------------------
 
 def load_previous_rates():
@@ -142,7 +177,7 @@ def should_send(rates, previous_rates):
 
 # --- Formatting -------------------------------------------------------------
 
-def format_email_body(rates, vcb_rates, previous_rates, vcb_error=None):
+def format_email_body(rates, vcb_rates, fawaz_rates, previous_rates, vcb_error=None, fawaz_error=None):
     lines = [f"Exchange rates to VND - {now_vn().strftime('%Y-%m-%d %H:%M')}\n"]
 
     lines.append("Market mid-rate")
@@ -173,6 +208,19 @@ def format_email_body(rates, vcb_rates, previous_rates, vcb_error=None):
     elif vcb_error:
         lines.append("")
         lines.append(f"Vietcombank official rate: unavailable this run ({vcb_error})")
+
+    if fawaz_rates:
+        lines.append("")
+        lines.append("fawazahmed0/currency-api (independent aggregator)")
+        lines.append(f"{'Currency':<10}{'1 unit = VND'}")
+        lines.append("-" * 38)
+        for code in rates:
+            if code in fawaz_rates:
+                lines.append(f"{code:<10}{fawaz_rates[code]:,.2f}")
+        used_sources.append(SOURCES[2])
+    elif fawaz_error:
+        lines.append("")
+        lines.append(f"fawazahmed0/currency-api: unavailable this run ({fawaz_error})")
 
     lines.append("")
     lines.append("Sources:")
@@ -211,11 +259,19 @@ def cmd_generate():
         vcb_rates = fetch_vcb_rates()
         vcb_error = None
     except Exception as e:
-        print(f"Vietcombank source failed ({e}), continuing with market rate only.")
+        print(f"Vietcombank source failed ({e}), continuing without it.")
         vcb_rates = {}
         vcb_error = str(e)
 
-    body = format_email_body(rates, vcb_rates, previous_rates, vcb_error)
+    try:
+        fawaz_rates = fetch_fawaz_rates()
+        fawaz_error = None
+    except Exception as e:
+        print(f"fawazahmed0 source failed ({e}), continuing without it.")
+        fawaz_rates = {}
+        fawaz_error = str(e)
+
+    body = format_email_body(rates, vcb_rates, fawaz_rates, previous_rates, vcb_error, fawaz_error)
     with open(EMAIL_BODY_FILE, "w") as f:
         f.write(body)
 
