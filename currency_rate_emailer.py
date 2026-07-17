@@ -1,15 +1,26 @@
 """
 currency_rate_emailer.py
 
-Fetches exchange rates for a watchlist of currencies -> VND, from two sources,
-and emails a summary. Designed to run on GitHub Actions (see
-.github/workflows/send-currency-rate.yml) or locally via cron. No local
+Fetches exchange rates for a watchlist of currencies -> VND, from five
+independent sources, and emails a summary. Designed to run on GitHub Actions
+(see .github/workflows/send-currency-rate.yml) or locally via cron. No local
 computer needs to stay on.
 
-Data sources:
+Data sources (each rendered as its own section, each degrades gracefully if
+it fails on a given run):
   1. Market mid-rate: https://www.exchangerate-api.com/ (open.er-api.com, free, no key)
-  2. Vietcombank official buy/sell rates: https://www.vietcombank.com.vn/ (public JSON endpoint,
-     the same data shown on https://www.vietcombank.com.vn/en-us/personal/support/exchange-rates)
+  2. Vietcombank official buy/sell rates: https://www.vietcombank.com.vn/ (public JSON endpoint;
+     may be blocked from cloud/datacenter IPs like GitHub Actions runners)
+  3. fawazahmed0/currency-api: free, no key, independent aggregator (jsDelivr CDN + pages.dev mirror)
+  4. exchangerate.fun (haxqer/FreeExchangeRateApi): free, no key, hourly updates
+  5. fxratesapi.com: free, no key needed for the latest-rates endpoint
+
+Extra features:
+  - Best-rate highlight: which source gives you the most/least VND per currency
+  - Cross-source discrepancy alert: flags currencies where sources disagree a lot
+  - Quick amount conversion: converts configured VND amounts into your watchlist
+  - Historical tracking + weekly trend: logs every run to rate_history.csv and
+    emails a 7-day % change summary once a week
 
 Usage:
     python currency_rate_emailer.py generate   # fetch rates, build email body -> email_body.txt
@@ -21,16 +32,19 @@ Required environment variables (set as GitHub Actions secrets, or export locally
     CURRENCY_RECIPIENT  - recipient email address
 
 Optional environment variables:
-    WATCHLIST                  - comma-separated currency codes, default below
-    ALERT_THRESHOLD_PERCENT    - only send if some rate moved >= this % since last run
-                                  (leave unset to always send)
+    WATCHLIST                     - comma-separated currency codes, default below
+    ALERT_THRESHOLD_PERCENT       - only send if some rate moved >= this % since last run
+                                     (leave unset to always send)
+    DISCREPANCY_THRESHOLD_PERCENT - flag a currency if sources disagree by >= this % (default 1.0)
+    CONVERT_AMOUNTS_VND           - comma-separated VND amounts to quick-convert, e.g. "1000000,5000000"
 """
 
 import os
 import sys
+import csv
 import json
 import smtplib
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from email.mime.text import MIMEText
 
@@ -47,6 +61,7 @@ def now_vn():
 
 DEFAULT_WATCHLIST = ["USD", "EUR", "JPY", "CNY", "KRW", "GBP", "SGD", "AUD"]
 WATCHLIST = os.environ.get("WATCHLIST", ",".join(DEFAULT_WATCHLIST)).split(",")
+WATCHLIST = [c.strip() for c in WATCHLIST]
 
 MARKET_API_URL = "https://open.er-api.com/v6/latest/VND"  # base=VND -> we invert to VND-per-unit
 VCB_API_URL = "https://www.vietcombank.com.vn/api/exchangerates"  # official VCB buy/sell, already in VND
@@ -83,9 +98,16 @@ SOURCES = [
 
 EMAIL_BODY_FILE = "email_body.txt"
 STATE_FILE = "last_rates.json"
+HISTORY_FILE = "rate_history.csv"
 
 ALERT_THRESHOLD_PERCENT = os.environ.get("ALERT_THRESHOLD_PERCENT")
 ALERT_THRESHOLD_PERCENT = float(ALERT_THRESHOLD_PERCENT) if ALERT_THRESHOLD_PERCENT else None
+
+DISCREPANCY_THRESHOLD_PERCENT = float(os.environ.get("DISCREPANCY_THRESHOLD_PERCENT", "1.0"))
+
+CONVERT_AMOUNTS_VND = [
+    float(a) for a in os.environ.get("CONVERT_AMOUNTS_VND", "1000000,5000000,10000000").split(",") if a.strip()
+]
 
 GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
@@ -109,7 +131,6 @@ def fetch_market_rates():
     vnd_to_x = data["rates"]  # base is VND, e.g. {"USD": 0.0000398, ...}
     rates = {}
     for code in WATCHLIST:
-        code = code.strip()
         rate = vnd_to_x.get(code)
         if rate:
             rates[code] = 1 / rate  # invert -> VND per 1 unit of `code`
@@ -128,7 +149,7 @@ def fetch_vcb_rates():
     rates = {}
     for row in data.get("Data", []):
         code = row.get("currencyCode")
-        if code and code.strip() in [c.strip() for c in WATCHLIST]:
+        if code and code.strip() in WATCHLIST:
             try:
                 buy = float(row.get("transfer") or row.get("cash") or 0)
                 sell = float(row.get("sell") or 0)
@@ -161,7 +182,6 @@ def fetch_fawaz_rates():
 
     rates = {}
     for code in WATCHLIST:
-        code = code.strip()
         rate = vnd_to_x.get(code.lower())
         if rate:
             rates[code] = 1 / rate  # invert -> VND per 1 unit of `code`
@@ -184,7 +204,6 @@ def fetch_fun_rates():
 
     rates = {}
     for code in WATCHLIST:
-        code = code.strip()
         if code == "USD":
             rates[code] = vnd_per_usd
             continue
@@ -198,7 +217,7 @@ def fetch_fxrates_rates():
     """Returns {currency_code: VND_per_unit} from fxratesapi.com (base=VND, no key needed)."""
     params = {
         "base": "VND",
-        "currencies": ",".join(c.strip() for c in WATCHLIST),
+        "currencies": ",".join(WATCHLIST),
         "format": "json",
     }
     resp = requests.get(FXRATES_API_URL, headers=HEADERS, params=params, timeout=15)
@@ -211,7 +230,6 @@ def fetch_fxrates_rates():
     vnd_to_x = data["rates"]  # base is VND, e.g. {"USD": 0.0000398, ...}
     rates = {}
     for code in WATCHLIST:
-        code = code.strip()
         rate = vnd_to_x.get(code)
         if rate:
             rates[code] = 1 / rate  # invert -> VND per 1 unit of `code`
@@ -243,11 +261,164 @@ def should_send(rates, previous_rates):
     return False
 
 
+# --- Historical tracking + weekly trend -------------------------------------
+
+def append_history(rates):
+    """Appends this run's market rates to a CSV: timestamp,currency,rate"""
+    is_new_file = not os.path.exists(HISTORY_FILE)
+    with open(HISTORY_FILE, "a", newline="") as f:
+        writer = csv.writer(f)
+        if is_new_file:
+            writer.writerow(["timestamp", "currency", "rate"])
+        ts = now_vn().strftime("%Y-%m-%d %H:%M")
+        for code, rate in rates.items():
+            writer.writerow([ts, code, rate])
+
+
+def weekly_trend_section():
+    """Once a week (first run after midnight Monday, Vietnam time), compares
+    today's rate to the rate from ~7 days ago and returns a summary section,
+    or None if it's not time yet / there's not enough history.
+    """
+    vn_now = now_vn()
+    is_weekly_slot = vn_now.weekday() == 0 and vn_now.hour == 0  # Monday, 00:xx
+    if not is_weekly_slot or not os.path.exists(HISTORY_FILE):
+        return None
+
+    cutoff = vn_now - timedelta(days=7)
+    oldest_near_cutoff = {}  # currency -> (timestamp, rate) closest to 7 days ago
+    latest = {}  # currency -> (timestamp, rate) most recent
+
+    with open(HISTORY_FILE) as f:
+        for row in csv.DictReader(f):
+            try:
+                ts = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M").replace(tzinfo=VN_TZ)
+                rate = float(row["rate"])
+            except (ValueError, KeyError):
+                continue
+            code = row["currency"]
+
+            if code not in latest or ts > latest[code][0]:
+                latest[code] = (ts, rate)
+
+            if ts <= cutoff and (code not in oldest_near_cutoff or ts > oldest_near_cutoff[code][0]):
+                oldest_near_cutoff[code] = (ts, rate)
+
+    lines = []
+    for code in WATCHLIST:
+        if code in latest and code in oldest_near_cutoff:
+            _, old_rate = oldest_near_cutoff[code]
+            _, new_rate = latest[code]
+            pct = (new_rate - old_rate) / old_rate * 100
+            arrow = "UP" if pct > 0 else ("DOWN" if pct < 0 else "FLAT")
+            lines.append(f"{code:<10}{arrow} {pct:+.2f}% over the past week")
+
+    if not lines:
+        return None  # not enough history yet (less than a week of data)
+
+    return ["Weekly trend (7-day change)"] + ["-" * 38] + lines
+
+
+# --- Best-rate + discrepancy analysis ----------------------------------------
+
+def collect_comparable_rates(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates):
+    """Builds {currency: {source_name: vnd_per_unit}} across all successful sources.
+    VCB contributes the average of its buy/sell as a single comparable figure.
+    """
+    comparable = {code: {} for code in WATCHLIST}
+
+    for code, rate in rates.items():
+        comparable[code][SOURCES[0][0]] = rate
+
+    for code, vals in vcb_rates.items():
+        avg = (vals["buy"] + vals["sell"]) / 2
+        comparable[code][SOURCES[1][0]] = avg
+
+    for code, rate in fawaz_rates.items():
+        comparable[code][SOURCES[2][0]] = rate
+
+    for code, rate in fun_rates.items():
+        comparable[code][SOURCES[3][0]] = rate
+
+    for code, rate in fxrates_rates.items():
+        comparable[code][SOURCES[4][0]] = rate
+
+    return comparable
+
+
+def best_rate_section(comparable):
+    """For each currency with 2+ sources, shows which source gives the most/least VND."""
+    lines = []
+    for code in WATCHLIST:
+        by_source = comparable.get(code, {})
+        if len(by_source) < 2:
+            continue
+        best_source, best_rate = max(by_source.items(), key=lambda kv: kv[1])
+        worst_source, worst_rate = min(by_source.items(), key=lambda kv: kv[1])
+        if best_source == worst_source:
+            continue
+        lines.append(f"{code:<5} highest: {best_rate:,.2f} VND ({best_source})")
+        lines.append(f"{'':<5} lowest:  {worst_rate:,.2f} VND ({worst_source})")
+
+    if not lines:
+        return None
+    return ["Best / lowest rate by source"] + ["-" * 38] + lines
+
+
+def discrepancy_section(comparable):
+    """Flags currencies where sources disagree by >= DISCREPANCY_THRESHOLD_PERCENT."""
+    lines = []
+    for code in WATCHLIST:
+        by_source = comparable.get(code, {})
+        if len(by_source) < 2:
+            continue
+        max_rate = max(by_source.values())
+        min_rate = min(by_source.values())
+        spread_pct = (max_rate - min_rate) / min_rate * 100
+        if spread_pct >= DISCREPANCY_THRESHOLD_PERCENT:
+            lines.append(f"{code:<5} sources disagree by {spread_pct:.2f}% (range {min_rate:,.2f} - {max_rate:,.2f} VND)")
+
+    if not lines:
+        return None
+    return [f"Source discrepancy alert (>= {DISCREPANCY_THRESHOLD_PERCENT:.1f}% spread)"] + ["-" * 38] + lines
+
+
+# --- Quick amount conversion --------------------------------------------------
+
+def conversion_section(rates):
+    """Converts each configured VND amount into every watchlist currency, using
+    the market mid-rate.
+    """
+    if not CONVERT_AMOUNTS_VND or not rates:
+        return None
+
+    lines = ["Quick conversions (market mid-rate)"]
+    lines.append("-" * 38)
+    for amount in CONVERT_AMOUNTS_VND:
+        parts = []
+        for code in WATCHLIST:
+            if code in rates:
+                converted = amount / rates[code]
+                parts.append(f"{code} {converted:,.2f}")
+        lines.append(f"{amount:,.0f} VND = " + " | ".join(parts))
+    return lines
+
+
 # --- Formatting -------------------------------------------------------------
 
 def format_email_body(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, previous_rates,
                        vcb_error=None, fawaz_error=None, fun_error=None, fxrates_error=None):
     lines = [f"Exchange rates to VND - {now_vn().strftime('%Y-%m-%d %H:%M')}\n"]
+
+    comparable = collect_comparable_rates(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates)
+
+    best = best_rate_section(comparable)
+    if best:
+        lines += best + [""]
+
+    discrepancy = discrepancy_section(comparable)
+    if discrepancy:
+        lines += discrepancy + [""]
 
     lines.append("Market mid-rate")
     lines.append(f"{'Currency':<10}{'1 unit = VND':<18}{'Change'}")
@@ -316,6 +487,16 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, p
     elif fxrates_error:
         lines.append("")
         lines.append(f"fxratesapi.com: unavailable this run ({fxrates_error})")
+
+    conversions = conversion_section(rates)
+    if conversions:
+        lines.append("")
+        lines += conversions
+
+    trend = weekly_trend_section()
+    if trend:
+        lines.append("")
+        lines += trend
 
     lines.append("")
     lines.append("Sources:")
@@ -389,6 +570,7 @@ def cmd_generate():
 
     print(body)
     save_rates(rates)
+    append_history(rates)
 
 
 def cmd_send():
