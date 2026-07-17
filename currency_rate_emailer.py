@@ -159,12 +159,28 @@ def fetch_market_rates():
     return rates
 
 
+VCB_HEADERS = {
+    **HEADERS,
+    # A 404 from a valid, browser-tested endpoint often means a WAF is checking these,
+    # not just User-Agent — pretending to arrive from VCB's own rates page.
+    "Referer": "https://www.vietcombank.com.vn/en-us/personal/support/exchange-rates",
+    "Origin": "https://www.vietcombank.com.vn",
+    "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+
+
 def fetch_vcb_rates():
     """Returns {currency_code: {"buy": VND, "sell": VND}} from Vietcombank's public feed.
     Rates are already denominated in VND, no inversion needed. If a currency isn't
     in VCB's list, it's simply omitted (falls back to market-only in the email).
+
+    Sends headers that mimic arriving from VCB's own rates page (Referer/Origin/
+    Accept-Language), since a 404 on an endpoint that works fine outside GitHub
+    Actions is more consistent with a WAF checking these than a hard IP block.
+    This is a best-effort fix — if VCB is blocking by IP range instead, this
+    won't help, and the section will keep showing "unavailable this run".
     """
-    resp = requests.get(VCB_API_URL, headers=HEADERS, timeout=15)
+    resp = requests.get(VCB_API_URL, headers=VCB_HEADERS, timeout=15)
     resp.raise_for_status()
     data = resp.json()
 
