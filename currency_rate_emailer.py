@@ -434,20 +434,29 @@ def discrepancy_section(comparable):
 
 def conversion_section(rates):
     """Converts each configured VND amount into every watchlist currency, using
-    the market mid-rate.
+    the market mid-rate. Rendered as a matrix: one row per currency, one column
+    per amount, so it reads as a table instead of a wrapped wall of text.
     """
     if not CONVERT_AMOUNTS_VND or not rates:
         return None
 
+    amount_headers = [f"{a:,.0f} VND" for a in CONVERT_AMOUNTS_VND]
+    col_width = max(12, max(len(h) for h in amount_headers) + 2)
+
     lines = ["Quick conversions", f"(calculated from {SOURCES[0][0]})"]
     lines.append("-" * 38)
-    for amount in CONVERT_AMOUNTS_VND:
-        parts = []
-        for code in WATCHLIST:
-            if code in rates:
-                converted = amount / rates[code]
-                parts.append(f"{symbol_for(code)}{converted:,.2f} {code}")
-        lines.append(f"{amount:,.0f} VND = " + " | ".join(parts))
+    header = f"{'Currency':<14}" + "".join(f"{h:<{col_width}}" for h in amount_headers)
+    lines.append(header)
+    lines.append("-" * len(header))
+    for code in WATCHLIST:
+        if code not in rates:
+            continue
+        row = f"{label_for(code):<14}"
+        for amount in CONVERT_AMOUNTS_VND:
+            converted = amount / rates[code]
+            cell = f"{symbol_for(code)}{converted:,.2f}"
+            row += f"{cell:<{col_width}}"
+        lines.append(row)
     return lines
 
 
@@ -755,13 +764,17 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, p
 
     # Quick conversions
     if CONVERT_AMOUNTS_VND and rates:
+        amount_headers = [f"{a:,.0f} VND" for a in CONVERT_AMOUNTS_VND]
         conv_rows = []
-        for amount in CONVERT_AMOUNTS_VND:
-            parts_str = " &nbsp;|&nbsp; ".join(
-                f"{symbol_for(code)}{amount / rates[code]:,.2f} {_html_escape(code)}" for code in WATCHLIST if code in rates
-            )
-            conv_rows.append((f"{amount:,.0f} VND", parts_str))
-        table = _html_source_table(conv_rows, ["Amount", "Converts to"])
+        for code in WATCHLIST:
+            if code not in rates:
+                continue
+            row = [f"<strong>{_html_label(code)}</strong>"]
+            for amount in CONVERT_AMOUNTS_VND:
+                converted = amount / rates[code]
+                row.append(f"{symbol_for(code)}{converted:,.2f}")
+            conv_rows.append(tuple(row))
+        table = _html_source_table(conv_rows, ["Currency"] + amount_headers)
         parts.append(_html_card(
             "Quick conversions", table,
             f"Calculated from {_html_escape(SOURCES[0][0])}",
