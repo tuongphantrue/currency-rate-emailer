@@ -2,12 +2,14 @@ name: Send Currency Rate
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   
+    - cron: "*/30 * * * *"   # every 30 minutes
   workflow_dispatch: {}    # lets you trigger it manually from the Actions tab
 
 jobs:
   send-currency-rate:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -30,3 +32,11 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           CURRENCY_RECIPIENT: ${{ secrets.CURRENCY_RECIPIENT }}
         run: python currency_rate_emailer.py send
+
+      - name: Commit updated rate cache and history
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add last_rates.json rate_history.csv || true
+          git diff --cached --quiet || git commit -m "Update rate cache and history [skip ci]"
+          git push || true
