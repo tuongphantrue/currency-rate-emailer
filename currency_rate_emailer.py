@@ -565,34 +565,83 @@ _HTML_COLORS = {
     "accent": "#0969da",
 }
 
+# One accent color per section, used for the card's left border, title, and a tinted
+# table-header background. Vietcombank uses their actual brand green as a deliberate touch.
+SECTION_ACCENTS = {
+    "best": "#0d9488",         # teal
+    "discrepancy": "#d97706",  # amber (paired with the warn background)
+    "market": "#2563eb",       # blue
+    "vcb": "#00693e",          # Vietcombank's own brand green
+    "fawaz": "#7c3aed",        # purple
+    "fxrates": "#ea580c",      # orange
+    "conversions": "#4f46e5",  # indigo
+    "trend": "#db2777",        # rose
+}
+
+# Small color dot shown next to each currency code, roughly evoking each currency's
+# home flag/brand without reproducing any actual flag imagery.
+CURRENCY_DOT_COLORS = {
+    "USD": "#2563eb", "EUR": "#7c3aed", "JPY": "#dc2626", "CNY": "#dc2626",
+    "KRW": "#2563eb", "GBP": "#1e3a8a", "SGD": "#dc2626", "AUD": "#059669",
+    "VND": "#dc2626", "CAD": "#dc2626", "CHF": "#dc2626", "HKD": "#dc2626",
+    "NZD": "#1e3a8a", "THB": "#7c3aed", "INR": "#ea580c", "IDR": "#dc2626",
+    "MYR": "#2563eb", "PHP": "#2563eb", "RUB": "#1e3a8a", "TWD": "#dc2626",
+    "TRY": "#dc2626", "ZAR": "#059669", "BRL": "#059669", "MXN": "#059669",
+    "AED": "#059669",
+}
+
+
+def _accent_of(code):
+    return CURRENCY_DOT_COLORS.get(code, "#57606a")
+
+
+def _tint(hex_color, amount=0.88):
+    """Lightens a hex color by blending it toward white. amount=0.88 means
+    88% white / 12% original color — used for subtle tinted backgrounds."""
+    hex_color = hex_color.lstrip("#")
+    r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+    r = round(r + (255 - r) * amount)
+    g = round(g + (255 - g) * amount)
+    b = round(b + (255 - b) * amount)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
 
 def _html_escape(s):
     return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
 def _html_label(code):
-    """Currency code + symbol for HTML display, e.g. 'USD <span>$</span>'."""
+    """Currency code + a small colored dot + symbol, e.g. '🔵 USD $'."""
     sym = CURRENCY_SYMBOLS.get(code)
+    dot_color = _accent_of(code)
+    dot = f'<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:{dot_color};margin-right:6px;"></span>'
     if not sym:
-        return _html_escape(code)
-    return f'{_html_escape(code)} <span style="color:{_HTML_COLORS["muted"]};">{_html_escape(sym)}</span>'
+        return f'{dot}{_html_escape(code)}'
+    return f'{dot}{_html_escape(code)} <span style="color:{_HTML_COLORS["muted"]};">{_html_escape(sym)}</span>'
 
 
 def _html_change_span(pct):
     if pct > 0:
-        color, arrow = _HTML_COLORS["up"], "&#9650;"
+        color, bg, arrow = _HTML_COLORS["up"], "#dcfce7", "&#9650;"
     elif pct < 0:
-        color, arrow = _HTML_COLORS["down"], "&#9660;"
+        color, bg, arrow = _HTML_COLORS["down"], "#fee2e2", "&#9660;"
     else:
-        color, arrow = _HTML_COLORS["flat"], "&#9679;"
-    return f'<span style="color:{color};font-weight:600;">{arrow} {pct:+.2f}%</span>'
+        color, bg, arrow = _HTML_COLORS["flat"], "#f1f3f5", "&#9679;"
+    return (
+        f'<span style="color:{color};background:{bg};font-weight:600;padding:2px 8px;'
+        f'border-radius:10px;font-size:13px;display:inline-block;">{arrow} {pct:+.2f}%</span>'
+    )
 
 
-def _html_source_table(rows, headers):
-    """rows: list of tuples matching headers. Renders a simple bordered table."""
+def _html_source_table(rows, headers, accent=None):
+    """rows: list of tuples matching headers. Renders a simple bordered table.
+    accent, if given, tints the header row background and text with that color."""
+    header_bg = _tint(accent, 0.90) if accent else "transparent"
+    header_color = accent if accent else _HTML_COLORS["muted"]
     th = "".join(
         f'<th style="text-align:left;padding:6px 10px;border-bottom:2px solid {_HTML_COLORS["border"]};'
-        f'font-size:12px;color:{_HTML_COLORS["muted"]};text-transform:uppercase;letter-spacing:.03em;">{h}</th>'
+        f'background:{header_bg};font-size:12px;color:{header_color};font-weight:700;'
+        f'text-transform:uppercase;letter-spacing:.03em;">{h}</th>'
         for h in headers
     )
     body_rows = ""
@@ -608,15 +657,23 @@ def _html_source_table(rows, headers):
     )
 
 
-def _html_card(title_html, inner_html, source_html, bg=None, border=None):
+def _html_card(title_html, inner_html, source_html, accent=None, bg=None, border=None):
     """source_html is required and always rendered — either a link to the
-    original source, or a short note for derived/multi-source sections."""
+    original source, or a short note for derived/multi-source sections.
+    accent, if given, colors the left border, title, and a small dot marker."""
     bg = bg or "#ffffff"
     border = border or _HTML_COLORS["border"]
+    left_border = f"4px solid {accent}" if accent else f"1px solid {border}"
+    title_color = accent if accent else _HTML_COLORS["text"]
+    dot = (
+        f'<span style="display:inline-block;width:9px;height:9px;border-radius:50%;'
+        f'background:{accent};margin-right:8px;vertical-align:middle;"></span>'
+        if accent else ""
+    )
     return (
-        f'<div style="border:1px solid {border};border-radius:8px;padding:16px 18px;'
-        f'margin-bottom:16px;background:{bg};">'
-        f'<div style="font-size:15px;font-weight:600;color:{_HTML_COLORS["text"]};margin-bottom:2px;">{title_html}</div>'
+        f'<div style="border:1px solid {border};border-left:{left_border};border-radius:8px;'
+        f'padding:16px 18px;margin-bottom:16px;background:{bg};">'
+        f'<div style="font-size:15px;font-weight:700;color:{title_color};margin-bottom:2px;">{dot}{title_html}</div>'
         f'<div style="font-size:11px;color:{_HTML_COLORS["muted"]};margin-bottom:10px;'
         f'text-transform:uppercase;letter-spacing:.03em;">{source_html}</div>'
         f"{inner_html}</div>"
@@ -639,9 +696,12 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, previous_rat
         f'max-width:640px;margin:0 auto;color:{C["text"]};">'
     )
     parts.append(
-        f'<h1 style="font-size:20px;margin:0 0 4px;">Exchange rates to VND</h1>'
-        f'<div style="font-size:13px;color:{C["muted"]};margin-bottom:20px;">'
+        f'<div style="background:#0d9488;background:linear-gradient(135deg,#0d9488,#2563eb);'
+        f'border-radius:10px;padding:20px 22px;margin-bottom:20px;">'
+        f'<h1 style="font-size:21px;margin:0 0 4px;color:#ffffff;">&#128176; Exchange rates to VND</h1>'
+        f'<div style="font-size:13px;color:#e0f2fe;">'
         f"{now_vn().strftime('%Y-%m-%d %H:%M')} (Vietnam time)</div>"
+        f'</div>'
     )
 
     # Best / lowest rate by source
@@ -660,10 +720,11 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, previous_rat
             f'{worst_rate:,.2f} <span style="color:{C["muted"]};font-size:12px;">({_html_escape(worst_source)})</span>',
         ))
     if best_rows:
-        table = _html_source_table(best_rows, ["Currency", "Highest", "Lowest"])
+        table = _html_source_table(best_rows, ["Currency", "Highest", "Lowest"], accent=SECTION_ACCENTS["best"])
         parts.append(_html_card(
             "Best / lowest rate by source", table,
             "Derived by comparing all sources below, per currency",
+            accent=SECTION_ACCENTS["best"],
         ))
 
     # Discrepancy alert
@@ -677,11 +738,12 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, previous_rat
         if spread_pct >= DISCREPANCY_THRESHOLD_PERCENT:
             disc_rows.append((f"<strong>{_html_label(code)}</strong>", f"{spread_pct:.2f}%", f"{min_rate:,.2f} - {max_rate:,.2f} VND"))
     if disc_rows:
-        table = _html_source_table(disc_rows, ["Currency", "Spread", "Range"])
+        table = _html_source_table(disc_rows, ["Currency", "Spread", "Range"], accent=SECTION_ACCENTS["discrepancy"])
         parts.append(_html_card(
             f"&#9888; Source discrepancy alert (&ge;{DISCREPANCY_THRESHOLD_PERCENT:.1f}%)",
             table,
             "Derived by comparing all sources below, per currency",
+            accent=SECTION_ACCENTS["discrepancy"],
             bg=C["warn_bg"], border=C["warn_border"],
         ))
 
@@ -696,8 +758,9 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, previous_rat
         market_rows.append((f"<strong>{_html_label(code)}</strong>", f"{rate:,.2f}", change_cell))
     parts.append(_html_card(
         "Market mid-rate",
-        _html_source_table(market_rows, ["Currency", "1 unit = VND", "Change"]),
+        _html_source_table(market_rows, ["Currency", "1 unit = VND", "Change"], accent=SECTION_ACCENTS["market"]),
         _html_source_link(*SOURCES[0]),
+        accent=SECTION_ACCENTS["market"],
     ))
 
     # Vietcombank
@@ -708,8 +771,9 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, previous_rat
         ]
         parts.append(_html_card(
             "Vietcombank official rate",
-            _html_source_table(vcb_rows, ["Currency", "Buy (VND)", "Sell (VND)"]),
+            _html_source_table(vcb_rows, ["Currency", "Buy (VND)", "Sell (VND)"], accent=SECTION_ACCENTS["vcb"]),
             _html_source_link(*SOURCES[1]),
+            accent=SECTION_ACCENTS["vcb"],
         ))
         used_sources.append(SOURCES[1])
     elif vcb_error:
@@ -717,19 +781,22 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, previous_rat
             "Vietcombank official rate",
             f'<div style="color:{C["muted"]};font-size:13px;">Unavailable this run: {_html_escape(vcb_error)}</div>',
             _html_source_link(*SOURCES[1]),
+            accent=SECTION_ACCENTS["vcb"],
         ))
 
     # Independent aggregators
-    for label, source_rates, error, source_entry in [
-        ("fawazahmed0/currency-api", fawaz_rates, fawaz_error, SOURCES[2]),
-        ("fxratesapi.com", fxrates_rates, fxrates_error, SOURCES[3]),
+    for label, source_rates, error, source_entry, accent_key in [
+        ("fawazahmed0/currency-api", fawaz_rates, fawaz_error, SOURCES[2], "fawaz"),
+        ("fxratesapi.com", fxrates_rates, fxrates_error, SOURCES[3], "fxrates"),
     ]:
+        accent = SECTION_ACCENTS[accent_key]
         if source_rates:
             rows = [(f"<strong>{_html_label(code)}</strong>", f"{source_rates[code]:,.2f}") for code in rates if code in source_rates]
             parts.append(_html_card(
                 f"{label} (independent aggregator)",
-                _html_source_table(rows, ["Currency", "1 unit = VND"]),
+                _html_source_table(rows, ["Currency", "1 unit = VND"], accent=accent),
                 _html_source_link(*source_entry),
+                accent=accent,
             ))
             used_sources.append(source_entry)
         elif error:
@@ -737,6 +804,7 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, previous_rat
                 f"{label} (independent aggregator)",
                 f'<div style="color:{C["muted"]};font-size:13px;">Unavailable this run: {_html_escape(error)}</div>',
                 _html_source_link(*source_entry),
+                accent=accent,
             ))
 
     # Quick conversions
@@ -751,10 +819,11 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, previous_rat
                 converted = amount / rates[code]
                 row.append(f"{symbol_for(code)}{converted:,.2f}")
             conv_rows.append(tuple(row))
-        table = _html_source_table(conv_rows, ["Currency"] + amount_headers)
+        table = _html_source_table(conv_rows, ["Currency"] + amount_headers, accent=SECTION_ACCENTS["conversions"])
         parts.append(_html_card(
             "Quick conversions", table,
             f"Calculated from {_html_escape(SOURCES[0][0])}",
+            accent=SECTION_ACCENTS["conversions"],
         ))
 
     # Weekly trend
@@ -763,8 +832,9 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, previous_rat
         rows = [(f"<strong>{_html_label(r['code'])}</strong>", _html_change_span(r["pct"])) for r in trend_rows]
         parts.append(_html_card(
             "Weekly trend (7-day change)",
-            _html_source_table(rows, ["Currency", "Change"]),
+            _html_source_table(rows, ["Currency", "Change"], accent=SECTION_ACCENTS["trend"]),
             f"Calculated from {_html_escape(SOURCES[0][0])} history, logged each run",
+            accent=SECTION_ACCENTS["trend"],
         ))
 
     # Sources footer
@@ -786,10 +856,10 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, previous_rat
 def send_email(body, html_body=None):
     if html_body:
         msg = MIMEMultipart("alternative")
-        msg.attach(MIMEText(body, "plain"))
-        msg.attach(MIMEText(html_body, "html"))
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
     else:
-        msg = MIMEText(body)
+        msg = MIMEText(body, "plain", "utf-8")
 
     msg["Subject"] = f"Daily Exchange Rates -> VND - {now_vn().strftime('%Y-%m-%d %H:%M')}"
     msg["From"] = GMAIL_ADDRESS
