@@ -12,8 +12,11 @@ it fails on a given run):
   2. Vietcombank official buy/sell rates: https://www.vietcombank.com.vn/ (public JSON endpoint;
      may be blocked from cloud/datacenter IPs like GitHub Actions runners)
   3. fawazahmed0/currency-api: free, no key, independent aggregator (jsDelivr CDN + pages.dev mirror)
-  4. exchangerate.fun (haxqer/FreeExchangeRateApi): free, no key, hourly updates
-  5. fxratesapi.com: free, no key needed for the latest-rates endpoint
+  4. fxratesapi.com: free, no key needed for the latest-rates endpoint
+
+  (exchangerate.fun was tried and removed — confirmed hard-blocked from GitHub
+  Actions even with retries, likely IP-level, and no free/no-key replacement
+  covering VND was found after two rounds of searching.)
 
 Extra features:
   - Best-rate highlight: which source gives you the most/least VND per currency
@@ -97,10 +100,6 @@ VCB_API_URL = "https://portal.vietcombank.com.vn/Usercontrols/TVPortal.TyGia/pXM
 FAWAZ_PRIMARY_URL = "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/vnd.json"
 FAWAZ_FALLBACK_URL = "https://latest.currency-api.pages.dev/v1/currencies/vnd.json"
 
-# exchangerate.fun (haxqer/FreeExchangeRateApi): free, no key, hourly updates, base is
-# always USD regardless of the `base` query param, so we compute cross-rates ourselves.
-FUN_API_URL = "https://api.exchangerate.fun/latest"
-
 # fxratesapi.com: free, no key needed for the latest-rates endpoint (per their docs/npm wrapper).
 FXRATES_API_URL = "https://api.fxratesapi.com/latest"
 
@@ -149,7 +148,6 @@ SOURCES = [
     ("Market mid-rate", "https://www.exchangerate-api.com/"),
     ("Vietcombank official rate", "https://www.vietcombank.com.vn/en-us/personal/support/exchange-rates"),
     ("fawazahmed0/currency-api", "https://github.com/fawazahmed0/currency-api"),
-    ("exchangerate.fun", "https://www.exchangerate.fun/"),
     ("fxratesapi.com", "https://fxratesapi.com/"),
 ]
 
@@ -247,30 +245,6 @@ def fetch_fawaz_rates():
         rate = vnd_to_x.get(code.lower())
         if rate:
             rates[code] = 1 / rate  # invert -> VND per 1 unit of `code`
-    return rates
-
-
-def fetch_fun_rates():
-    """Returns {currency_code: VND_per_unit} from exchangerate.fun.
-    The API always responds with base=USD regardless of the `base` param requested,
-    so we compute the VND cross-rate ourselves: VND per 1 X = rates[VND] / rates[X].
-    """
-    resp = get_with_retry(FUN_API_URL, headers=HEADERS, timeout=15)
-    data = resp.json()
-
-    usd_to_x = data["rates"]  # base is USD, e.g. {"VND": 26253.6, "EUR": 0.87, ...}
-    vnd_per_usd = usd_to_x.get("VND")
-    if not vnd_per_usd:
-        raise RuntimeError("VND not present in exchangerate.fun response")
-
-    rates = {}
-    for code in WATCHLIST:
-        if code == "USD":
-            rates[code] = vnd_per_usd
-            continue
-        usd_per_code = usd_to_x.get(code)
-        if usd_per_code:
-            rates[code] = vnd_per_usd / usd_per_code
     return rates
 
 
@@ -389,7 +363,7 @@ def weekly_trend_rows():
 
 # --- Best-rate + discrepancy analysis ----------------------------------------
 
-def collect_comparable_rates(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates):
+def collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates):
     """Builds {currency: {source_name: vnd_per_unit}} across all successful sources.
     VCB contributes the average of its buy/sell as a single comparable figure.
     """
@@ -405,11 +379,8 @@ def collect_comparable_rates(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_r
     for code, rate in fawaz_rates.items():
         comparable[code][SOURCES[2][0]] = rate
 
-    for code, rate in fun_rates.items():
-        comparable[code][SOURCES[3][0]] = rate
-
     for code, rate in fxrates_rates.items():
-        comparable[code][SOURCES[4][0]] = rate
+        comparable[code][SOURCES[3][0]] = rate
 
     return comparable
 
@@ -484,11 +455,11 @@ def conversion_section(rates):
 
 # --- Formatting -------------------------------------------------------------
 
-def format_email_body(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, previous_rates,
-                       vcb_error=None, fawaz_error=None, fun_error=None, fxrates_error=None):
+def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, previous_rates,
+                       vcb_error=None, fawaz_error=None, fxrates_error=None):
     lines = [f"Exchange rates to VND - {now_vn().strftime('%Y-%m-%d %H:%M')}\n"]
 
-    comparable = collect_comparable_rates(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates)
+    comparable = collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates)
 
     best = best_rate_section(comparable)
     if best:
@@ -545,35 +516,20 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, p
         lines.append(f"fawazahmed0/currency-api: unavailable this run ({fawaz_error})")
         lines.append(f"(source: {SOURCES[2][0]} - {SOURCES[2][1]})")
 
-    if fun_rates:
-        lines.append("")
-        lines.append("exchangerate.fun (independent aggregator)")
-        lines.append(f"(source: {SOURCES[3][0]} - {SOURCES[3][1]})")
-        lines.append(f"{'Currency':<14}{'1 unit = VND'}")
-        lines.append("-" * 38)
-        for code in rates:
-            if code in fun_rates:
-                lines.append(f"{label_for(code):<14}{fun_rates[code]:,.2f}")
-        used_sources.append(SOURCES[3])
-    elif fun_error:
-        lines.append("")
-        lines.append(f"exchangerate.fun: unavailable this run ({fun_error})")
-        lines.append(f"(source: {SOURCES[3][0]} - {SOURCES[3][1]})")
-
     if fxrates_rates:
         lines.append("")
         lines.append("fxratesapi.com (independent aggregator)")
-        lines.append(f"(source: {SOURCES[4][0]} - {SOURCES[4][1]})")
+        lines.append(f"(source: {SOURCES[3][0]} - {SOURCES[3][1]})")
         lines.append(f"{'Currency':<14}{'1 unit = VND'}")
         lines.append("-" * 38)
         for code in rates:
             if code in fxrates_rates:
                 lines.append(f"{label_for(code):<14}{fxrates_rates[code]:,.2f}")
-        used_sources.append(SOURCES[4])
+        used_sources.append(SOURCES[3])
     elif fxrates_error:
         lines.append("")
         lines.append(f"fxratesapi.com: unavailable this run ({fxrates_error})")
-        lines.append(f"(source: {SOURCES[4][0]} - {SOURCES[4][1]})")
+        lines.append(f"(source: {SOURCES[3][0]} - {SOURCES[3][1]})")
 
     conversions = conversion_section(rates)
     if conversions:
@@ -671,10 +627,10 @@ def _html_source_link(name, url):
     return f'Source: <a href="{url}" style="color:{_HTML_COLORS["accent"]};text-decoration:none;">{_html_escape(name)}</a>'
 
 
-def format_email_html(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, previous_rates,
-                       vcb_error=None, fawaz_error=None, fun_error=None, fxrates_error=None):
+def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, previous_rates,
+                       vcb_error=None, fawaz_error=None, fxrates_error=None):
     C = _HTML_COLORS
-    comparable = collect_comparable_rates(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates)
+    comparable = collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates)
     used_sources = [SOURCES[0]]
 
     parts = []
@@ -766,8 +722,7 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, p
     # Independent aggregators
     for label, source_rates, error, source_entry in [
         ("fawazahmed0/currency-api", fawaz_rates, fawaz_error, SOURCES[2]),
-        ("exchangerate.fun", fun_rates, fun_error, SOURCES[3]),
-        ("fxratesapi.com", fxrates_rates, fxrates_error, SOURCES[4]),
+        ("fxratesapi.com", fxrates_rates, fxrates_error, SOURCES[3]),
     ]:
         if source_rates:
             rows = [(f"<strong>{_html_label(code)}</strong>", f"{source_rates[code]:,.2f}") for code in rates if code in source_rates]
@@ -874,14 +829,6 @@ def cmd_generate():
         fawaz_error = str(e)
 
     try:
-        fun_rates = fetch_fun_rates()
-        fun_error = None
-    except Exception as e:
-        print(f"exchangerate.fun source failed ({e}), continuing without it.")
-        fun_rates = {}
-        fun_error = str(e)
-
-    try:
         fxrates_rates = fetch_fxrates_rates()
         fxrates_error = None
     except Exception as e:
@@ -889,10 +836,10 @@ def cmd_generate():
         fxrates_rates = {}
         fxrates_error = str(e)
 
-    body = format_email_body(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, previous_rates,
-                              vcb_error, fawaz_error, fun_error, fxrates_error)
-    html_body = format_email_html(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, previous_rates,
-                                   vcb_error, fawaz_error, fun_error, fxrates_error)
+    body = format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, previous_rates,
+                              vcb_error, fawaz_error, fxrates_error)
+    html_body = format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, previous_rates,
+                                   vcb_error, fawaz_error, fxrates_error)
     with open(EMAIL_BODY_FILE, "w") as f:
         f.write(body)
     with open(EMAIL_HTML_FILE, "w") as f:
