@@ -44,6 +44,7 @@ import sys
 import csv
 import json
 import smtplib
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from email.mime.text import MIMEText
@@ -85,7 +86,10 @@ def label_for(code):
     return f"{code} {sym}" if sym else code
 
 MARKET_API_URL = "https://open.er-api.com/v6/latest/VND"  # base=VND -> we invert to VND-per-unit
-VCB_API_URL = "https://www.vietcombank.com.vn/api/exchangerates"  # official VCB buy/sell, already in VND
+VCB_API_URL = "https://portal.vietcombank.com.vn/Usercontrols/TVPortal.TyGia/pXML.aspx"  # official VCB feed
+# This is Vietcombank's own documented public feed (linked from their exchange-rates page as
+# "if you need rates in XML format"). Their comment in the response asks for at most one
+# request every 5 minutes — this script runs every 30 minutes by default, well within that.
 
 # fawazahmed0/currency-api: free, no key, independent aggregator, mirrored on two CDNs
 # so a fallback is available if the primary CDN has a hiccup.
@@ -159,42 +163,33 @@ def fetch_market_rates():
     return rates
 
 
-VCB_HEADERS = {
-    **HEADERS,
-    # A 404 from a valid, browser-tested endpoint often means a WAF is checking these,
-    # not just User-Agent — pretending to arrive from VCB's own rates page.
-    "Referer": "https://www.vietcombank.com.vn/en-us/personal/support/exchange-rates",
-    "Origin": "https://www.vietcombank.com.vn",
-    "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-}
-
-
 def fetch_vcb_rates():
-    """Returns {currency_code: {"buy": VND, "sell": VND}} from Vietcombank's public feed.
-    Rates are already denominated in VND, no inversion needed. If a currency isn't
-    in VCB's list, it's simply omitted (falls back to market-only in the email).
+    """Returns {currency_code: {"buy": VND, "sell": VND}} from Vietcombank's official
+    public XML feed (their own documented endpoint for programmatic access). Rates
+    are already denominated in VND, no inversion needed. If a currency isn't in
+    VCB's list, it's simply omitted (falls back to other sources in the email).
 
-    Sends headers that mimic arriving from VCB's own rates page (Referer/Origin/
-    Accept-Language), since a 404 on an endpoint that works fine outside GitHub
-    Actions is more consistent with a WAF checking these than a hard IP block.
-    This is a best-effort fix — if VCB is blocking by IP range instead, this
-    won't help, and the section will keep showing "unavailable this run".
+    "buy" uses the bank-transfer buy rate (usually always populated); the cash buy
+    rate is sometimes "-" (not offered) for less common currencies.
     """
-    resp = requests.get(VCB_API_URL, headers=VCB_HEADERS, timeout=15)
+    resp = requests.get(VCB_API_URL, headers=HEADERS, timeout=15)
     resp.raise_for_status()
-    data = resp.json()
 
+    root = ET.fromstring(resp.content)
     rates = {}
-    for row in data.get("Data", []):
-        code = row.get("currencyCode")
-        if code and code.strip() in WATCHLIST:
-            try:
-                buy = float(row.get("transfer") or row.get("cash") or 0)
-                sell = float(row.get("sell") or 0)
-            except ValueError:
-                continue
-            if buy or sell:
-                rates[code] = {"buy": buy, "sell": sell}
+    for el in root.findall("Exrate"):
+        code = (el.get("CurrencyCode") or "").strip()
+        if code not in WATCHLIST:
+            continue
+
+        def to_float(raw):
+            raw = (raw or "").strip().replace(",", "")
+            return float(raw) if raw and raw != "-" else None
+
+        buy = to_float(el.get("Transfer")) or to_float(el.get("Buy"))
+        sell = to_float(el.get("Sell"))
+        if buy or sell:
+            rates[code] = {"buy": buy or 0.0, "sell": sell or 0.0}
     return rates
 
 
