@@ -306,7 +306,7 @@ def weekly_trend_section():
     if not rows:
         return None
     lines = [f"{label_for(r['code']):<14}{r['arrow']} {r['pct']:+.2f}% over the past week" for r in rows]
-    return ["Weekly trend (7-day change)"] + ["-" * 38] + lines
+    return ["Weekly trend (7-day change)", f"(source: {SOURCES[0][0]} history, logged each run)"] + ["-" * 38] + lines
 
 
 def weekly_trend_rows():
@@ -392,7 +392,7 @@ def best_rate_section(comparable):
 
     if not lines:
         return None
-    return ["Best / lowest rate by source"] + ["-" * 38] + lines
+    return ["Best / lowest rate by source", "(derived by comparing all sources below, per currency)"] + ["-" * 38] + lines
 
 
 def discrepancy_section(comparable):
@@ -410,7 +410,8 @@ def discrepancy_section(comparable):
 
     if not lines:
         return None
-    return [f"Source discrepancy alert (>= {DISCREPANCY_THRESHOLD_PERCENT:.1f}% spread)"] + ["-" * 38] + lines
+    return [f"Source discrepancy alert (>= {DISCREPANCY_THRESHOLD_PERCENT:.1f}% spread)",
+            "(derived by comparing all sources below, per currency)"] + ["-" * 38] + lines
 
 
 # --- Quick amount conversion --------------------------------------------------
@@ -422,7 +423,7 @@ def conversion_section(rates):
     if not CONVERT_AMOUNTS_VND or not rates:
         return None
 
-    lines = ["Quick conversions (market mid-rate)"]
+    lines = ["Quick conversions", f"(calculated from {SOURCES[0][0]})"]
     lines.append("-" * 38)
     for amount in CONVERT_AMOUNTS_VND:
         parts = []
@@ -451,6 +452,7 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, p
         lines += discrepancy + [""]
 
     lines.append("Market mid-rate")
+    lines.append(f"(source: {SOURCES[0][0]} - {SOURCES[0][1]})")
     lines.append(f"{'Currency':<14}{'1 unit = VND':<18}{'Change'}")
     lines.append("-" * 38)
     for code, rate in rates.items():
@@ -467,6 +469,7 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, p
     if vcb_rates:
         lines.append("")
         lines.append("Vietcombank official rate")
+        lines.append(f"(source: {SOURCES[1][0]} - {SOURCES[1][1]})")
         lines.append(f"{'Currency':<14}{'Buy (VND)':<16}{'Sell (VND)'}")
         lines.append("-" * 38)
         for code in rates:
@@ -478,10 +481,12 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, p
     elif vcb_error:
         lines.append("")
         lines.append(f"Vietcombank official rate: unavailable this run ({vcb_error})")
+        lines.append(f"(source: {SOURCES[1][0]} - {SOURCES[1][1]})")
 
     if fawaz_rates:
         lines.append("")
         lines.append("fawazahmed0/currency-api (independent aggregator)")
+        lines.append(f"(source: {SOURCES[2][0]} - {SOURCES[2][1]})")
         lines.append(f"{'Currency':<14}{'1 unit = VND'}")
         lines.append("-" * 38)
         for code in rates:
@@ -491,10 +496,12 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, p
     elif fawaz_error:
         lines.append("")
         lines.append(f"fawazahmed0/currency-api: unavailable this run ({fawaz_error})")
+        lines.append(f"(source: {SOURCES[2][0]} - {SOURCES[2][1]})")
 
     if fun_rates:
         lines.append("")
         lines.append("exchangerate.fun (independent aggregator)")
+        lines.append(f"(source: {SOURCES[3][0]} - {SOURCES[3][1]})")
         lines.append(f"{'Currency':<14}{'1 unit = VND'}")
         lines.append("-" * 38)
         for code in rates:
@@ -504,10 +511,12 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, p
     elif fun_error:
         lines.append("")
         lines.append(f"exchangerate.fun: unavailable this run ({fun_error})")
+        lines.append(f"(source: {SOURCES[3][0]} - {SOURCES[3][1]})")
 
     if fxrates_rates:
         lines.append("")
         lines.append("fxratesapi.com (independent aggregator)")
+        lines.append(f"(source: {SOURCES[4][0]} - {SOURCES[4][1]})")
         lines.append(f"{'Currency':<14}{'1 unit = VND'}")
         lines.append("-" * 38)
         for code in rates:
@@ -517,6 +526,7 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, p
     elif fxrates_error:
         lines.append("")
         lines.append(f"fxratesapi.com: unavailable this run ({fxrates_error})")
+        lines.append(f"(source: {SOURCES[4][0]} - {SOURCES[4][1]})")
 
     conversions = conversion_section(rates)
     if conversions:
@@ -595,15 +605,23 @@ def _html_source_table(rows, headers):
     )
 
 
-def _html_card(title_html, inner_html, bg=None, border=None):
+def _html_card(title_html, inner_html, source_html, bg=None, border=None):
+    """source_html is required and always rendered — either a link to the
+    original source, or a short note for derived/multi-source sections."""
     bg = bg or "#ffffff"
     border = border or _HTML_COLORS["border"]
     return (
         f'<div style="border:1px solid {border};border-radius:8px;padding:16px 18px;'
         f'margin-bottom:16px;background:{bg};">'
-        f'<div style="font-size:15px;font-weight:600;color:{_HTML_COLORS["text"]};margin-bottom:4px;">{title_html}</div>'
+        f'<div style="font-size:15px;font-weight:600;color:{_HTML_COLORS["text"]};margin-bottom:2px;">{title_html}</div>'
+        f'<div style="font-size:11px;color:{_HTML_COLORS["muted"]};margin-bottom:10px;'
+        f'text-transform:uppercase;letter-spacing:.03em;">{source_html}</div>'
         f"{inner_html}</div>"
     )
+
+
+def _html_source_link(name, url):
+    return f'Source: <a href="{url}" style="color:{_HTML_COLORS["accent"]};text-decoration:none;">{_html_escape(name)}</a>'
 
 
 def format_email_html(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, previous_rates,
@@ -640,7 +658,10 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, p
         ))
     if best_rows:
         table = _html_source_table(best_rows, ["Currency", "Highest", "Lowest"])
-        parts.append(_html_card("Best / lowest rate by source", table))
+        parts.append(_html_card(
+            "Best / lowest rate by source", table,
+            "Derived by comparing all sources below, per currency",
+        ))
 
     # Discrepancy alert
     disc_rows = []
@@ -656,7 +677,9 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, p
         table = _html_source_table(disc_rows, ["Currency", "Spread", "Range"])
         parts.append(_html_card(
             f"&#9888; Source discrepancy alert (&ge;{DISCREPANCY_THRESHOLD_PERCENT:.1f}%)",
-            table, bg=C["warn_bg"], border=C["warn_border"],
+            table,
+            "Derived by comparing all sources below, per currency",
+            bg=C["warn_bg"], border=C["warn_border"],
         ))
 
     # Market mid-rate
@@ -668,7 +691,11 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, p
             pct = (rate - prev) / prev * 100
             change_cell = _html_change_span(pct)
         market_rows.append((f"<strong>{_html_label(code)}</strong>", f"{rate:,.2f}", change_cell))
-    parts.append(_html_card("Market mid-rate", _html_source_table(market_rows, ["Currency", "1 unit = VND", "Change"])))
+    parts.append(_html_card(
+        "Market mid-rate",
+        _html_source_table(market_rows, ["Currency", "1 unit = VND", "Change"]),
+        _html_source_link(*SOURCES[0]),
+    ))
 
     # Vietcombank
     if vcb_rates:
@@ -676,23 +703,39 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, p
             (f"<strong>{_html_label(code)}</strong>", f"{vcb_rates[code]['buy']:,.2f}", f"{vcb_rates[code]['sell']:,.2f}")
             for code in rates if code in vcb_rates
         ]
-        parts.append(_html_card("Vietcombank official rate", _html_source_table(vcb_rows, ["Currency", "Buy (VND)", "Sell (VND)"])))
+        parts.append(_html_card(
+            "Vietcombank official rate",
+            _html_source_table(vcb_rows, ["Currency", "Buy (VND)", "Sell (VND)"]),
+            _html_source_link(*SOURCES[1]),
+        ))
         used_sources.append(SOURCES[1])
     elif vcb_error:
-        parts.append(_html_card("Vietcombank official rate", f'<div style="color:{C["muted"]};font-size:13px;">Unavailable this run: {_html_escape(vcb_error)}</div>'))
+        parts.append(_html_card(
+            "Vietcombank official rate",
+            f'<div style="color:{C["muted"]};font-size:13px;">Unavailable this run: {_html_escape(vcb_error)}</div>',
+            _html_source_link(*SOURCES[1]),
+        ))
 
     # Independent aggregators
     for label, source_rates, error, source_entry in [
-        ("fawazahmed0/currency-api (independent aggregator)", fawaz_rates, fawaz_error, SOURCES[2]),
-        ("exchangerate.fun (independent aggregator)", fun_rates, fun_error, SOURCES[3]),
-        ("fxratesapi.com (independent aggregator)", fxrates_rates, fxrates_error, SOURCES[4]),
+        ("fawazahmed0/currency-api", fawaz_rates, fawaz_error, SOURCES[2]),
+        ("exchangerate.fun", fun_rates, fun_error, SOURCES[3]),
+        ("fxratesapi.com", fxrates_rates, fxrates_error, SOURCES[4]),
     ]:
         if source_rates:
             rows = [(f"<strong>{_html_label(code)}</strong>", f"{source_rates[code]:,.2f}") for code in rates if code in source_rates]
-            parts.append(_html_card(label, _html_source_table(rows, ["Currency", "1 unit = VND"])))
+            parts.append(_html_card(
+                f"{label} (independent aggregator)",
+                _html_source_table(rows, ["Currency", "1 unit = VND"]),
+                _html_source_link(*source_entry),
+            ))
             used_sources.append(source_entry)
         elif error:
-            parts.append(_html_card(label, f'<div style="color:{C["muted"]};font-size:13px;">Unavailable this run: {_html_escape(error)}</div>'))
+            parts.append(_html_card(
+                f"{label} (independent aggregator)",
+                f'<div style="color:{C["muted"]};font-size:13px;">Unavailable this run: {_html_escape(error)}</div>',
+                _html_source_link(*source_entry),
+            ))
 
     # Quick conversions
     if CONVERT_AMOUNTS_VND and rates:
@@ -703,13 +746,20 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, p
             )
             conv_rows.append((f"{amount:,.0f} VND", parts_str))
         table = _html_source_table(conv_rows, ["Amount", "Converts to"])
-        parts.append(_html_card("Quick conversions (market mid-rate)", table))
+        parts.append(_html_card(
+            "Quick conversions", table,
+            f"Calculated from {_html_escape(SOURCES[0][0])}",
+        ))
 
     # Weekly trend
     trend_rows = weekly_trend_rows()
     if trend_rows:
         rows = [(f"<strong>{_html_label(r['code'])}</strong>", _html_change_span(r["pct"])) for r in trend_rows]
-        parts.append(_html_card("Weekly trend (7-day change)", _html_source_table(rows, ["Currency", "Change"])))
+        parts.append(_html_card(
+            "Weekly trend (7-day change)",
+            _html_source_table(rows, ["Currency", "Change"]),
+            f"Calculated from {_html_escape(SOURCES[0][0])} history, logged each run",
+        ))
 
     # Sources footer
     source_links = " &nbsp;&middot;&nbsp; ".join(
