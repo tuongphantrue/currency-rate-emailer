@@ -43,6 +43,7 @@ import os
 import sys
 import csv
 import json
+import time
 import smtplib
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
@@ -113,6 +114,37 @@ HEADERS = {
     "Accept": "application/json",
 }
 
+# Retried on these status codes: 429/403 often indicate rate limiting on small free
+# APIs (not just permission errors), and 5xx are transient server issues.
+RETRYABLE_STATUS_CODES = {403, 429, 500, 502, 503, 504}
+RETRY_ATTEMPTS = 3
+RETRY_BACKOFF_BASE_SECONDS = 2  # waits ~2s, then ~4s between attempts
+
+
+def get_with_retry(url, headers=None, params=None, timeout=15):
+    """requests.get wrapper with exponential backoff on transient failures
+    (connection errors, timeouts, or retryable HTTP status codes). Raises the
+    last error if every attempt fails — callers already handle that per-source
+    and degrade gracefully.
+    """
+    last_error = None
+    for attempt in range(RETRY_ATTEMPTS):
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=timeout)
+            if resp.status_code in RETRYABLE_STATUS_CODES and attempt < RETRY_ATTEMPTS - 1:
+                last_error = requests.HTTPError(f"{resp.status_code} (retrying)", response=resp)
+                time.sleep(RETRY_BACKOFF_BASE_SECONDS * (2 ** attempt))
+                continue
+            resp.raise_for_status()
+            return resp
+        except (requests.ConnectionError, requests.Timeout) as e:
+            last_error = e
+            if attempt < RETRY_ATTEMPTS - 1:
+                time.sleep(RETRY_BACKOFF_BASE_SECONDS * (2 ** attempt))
+                continue
+            raise
+    raise last_error
+
 SOURCES = [
     ("Market mid-rate", "https://www.exchangerate-api.com/"),
     ("Vietcombank official rate", "https://www.vietcombank.com.vn/en-us/personal/support/exchange-rates"),
@@ -147,8 +179,7 @@ SMTP_PORT = 587
 
 def fetch_market_rates():
     """Returns {currency_code: VND_per_unit} from the market mid-rate API."""
-    resp = requests.get(MARKET_API_URL, headers=HEADERS, timeout=15)
-    resp.raise_for_status()
+    resp = get_with_retry(MARKET_API_URL, headers=HEADERS, timeout=15)
     data = resp.json()
 
     if data.get("result") != "success":
@@ -172,8 +203,7 @@ def fetch_vcb_rates():
     "buy" uses the bank-transfer buy rate (usually always populated); the cash buy
     rate is sometimes "-" (not offered) for less common currencies.
     """
-    resp = requests.get(VCB_API_URL, headers=HEADERS, timeout=15)
-    resp.raise_for_status()
+    resp = get_with_retry(VCB_API_URL, headers=HEADERS, timeout=15)
 
     root = ET.fromstring(resp.content)
     rates = {}
@@ -201,8 +231,7 @@ def fetch_fawaz_rates():
     last_error = None
     for url in (FAWAZ_PRIMARY_URL, FAWAZ_FALLBACK_URL):
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=15)
-            resp.raise_for_status()
+            resp = get_with_retry(url, headers=HEADERS, timeout=15)
             data = resp.json()
             vnd_to_x = data["vnd"]  # e.g. {"usd": 0.0000398, ...}
             break
@@ -226,8 +255,7 @@ def fetch_fun_rates():
     The API always responds with base=USD regardless of the `base` param requested,
     so we compute the VND cross-rate ourselves: VND per 1 X = rates[VND] / rates[X].
     """
-    resp = requests.get(FUN_API_URL, headers=HEADERS, timeout=15)
-    resp.raise_for_status()
+    resp = get_with_retry(FUN_API_URL, headers=HEADERS, timeout=15)
     data = resp.json()
 
     usd_to_x = data["rates"]  # base is USD, e.g. {"VND": 26253.6, "EUR": 0.87, ...}
@@ -253,8 +281,7 @@ def fetch_fxrates_rates():
         "currencies": ",".join(WATCHLIST),
         "format": "json",
     }
-    resp = requests.get(FXRATES_API_URL, headers=HEADERS, params=params, timeout=15)
-    resp.raise_for_status()
+    resp = get_with_retry(FXRATES_API_URL, headers=HEADERS, params=params, timeout=15)
     data = resp.json()
 
     if not data.get("success"):
