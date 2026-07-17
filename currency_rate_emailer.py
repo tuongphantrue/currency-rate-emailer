@@ -47,6 +47,7 @@ import smtplib
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 import requests
 
@@ -97,6 +98,7 @@ SOURCES = [
 ]
 
 EMAIL_BODY_FILE = "email_body.txt"
+EMAIL_HTML_FILE = "email_body.html"
 STATE_FILE = "last_rates.json"
 HISTORY_FILE = "rate_history.csv"
 
@@ -280,6 +282,17 @@ def weekly_trend_section():
     today's rate to the rate from ~7 days ago and returns a summary section,
     or None if it's not time yet / there's not enough history.
     """
+    rows = weekly_trend_rows()
+    if not rows:
+        return None
+    lines = [f"{r['code']:<10}{r['arrow']} {r['pct']:+.2f}% over the past week" for r in rows]
+    return ["Weekly trend (7-day change)"] + ["-" * 38] + lines
+
+
+def weekly_trend_rows():
+    """Returns [{"code", "pct", "arrow"}] for the weekly trend, or None if it's
+    not the weekly slot yet / there's not enough history.
+    """
     vn_now = now_vn()
     is_weekly_slot = vn_now.weekday() == 0 and vn_now.hour == 0  # Monday, 00:xx
     if not is_weekly_slot or not os.path.exists(HISTORY_FILE):
@@ -304,19 +317,16 @@ def weekly_trend_section():
             if ts <= cutoff and (code not in oldest_near_cutoff or ts > oldest_near_cutoff[code][0]):
                 oldest_near_cutoff[code] = (ts, rate)
 
-    lines = []
+    rows = []
     for code in WATCHLIST:
         if code in latest and code in oldest_near_cutoff:
             _, old_rate = oldest_near_cutoff[code]
             _, new_rate = latest[code]
             pct = (new_rate - old_rate) / old_rate * 100
             arrow = "UP" if pct > 0 else ("DOWN" if pct < 0 else "FLAT")
-            lines.append(f"{code:<10}{arrow} {pct:+.2f}% over the past week")
+            rows.append({"code": code, "pct": pct, "arrow": arrow})
 
-    if not lines:
-        return None  # not enough history yet (less than a week of data)
-
-    return ["Weekly trend (7-day change)"] + ["-" * 38] + lines
+    return rows or None
 
 
 # --- Best-rate + discrepancy analysis ----------------------------------------
@@ -506,10 +516,197 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, p
     return "\n".join(lines)
 
 
+# --- HTML formatting -------------------------------------------------------
+
+# Color palette kept intentionally small: one accent per direction, neutral grays for structure.
+_HTML_COLORS = {
+    "up": "#1a7f37",
+    "down": "#cf222e",
+    "flat": "#57606a",
+    "border": "#e1e4e8",
+    "muted": "#57606a",
+    "card_bg": "#f6f8fa",
+    "warn_bg": "#fff8e5",
+    "warn_border": "#f2c744",
+    "text": "#1f2328",
+    "accent": "#0969da",
+}
+
+
+def _html_escape(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _html_change_span(pct):
+    if pct > 0:
+        color, arrow = _HTML_COLORS["up"], "&#9650;"
+    elif pct < 0:
+        color, arrow = _HTML_COLORS["down"], "&#9660;"
+    else:
+        color, arrow = _HTML_COLORS["flat"], "&#9679;"
+    return f'<span style="color:{color};font-weight:600;">{arrow} {pct:+.2f}%</span>'
+
+
+def _html_source_table(rows, headers):
+    """rows: list of tuples matching headers. Renders a simple bordered table."""
+    th = "".join(
+        f'<th style="text-align:left;padding:6px 10px;border-bottom:2px solid {_HTML_COLORS["border"]};'
+        f'font-size:12px;color:{_HTML_COLORS["muted"]};text-transform:uppercase;letter-spacing:.03em;">{h}</th>'
+        for h in headers
+    )
+    body_rows = ""
+    for row in rows:
+        cells = "".join(
+            f'<td style="padding:6px 10px;border-bottom:1px solid {_HTML_COLORS["border"]};font-size:14px;">{cell}</td>'
+            for cell in row
+        )
+        body_rows += f"<tr>{cells}</tr>"
+    return (
+        f'<table style="border-collapse:collapse;width:100%;margin:8px 0 20px;">'
+        f"<thead><tr>{th}</tr></thead><tbody>{body_rows}</tbody></table>"
+    )
+
+
+def _html_card(title_html, inner_html, bg=None, border=None):
+    bg = bg or "#ffffff"
+    border = border or _HTML_COLORS["border"]
+    return (
+        f'<div style="border:1px solid {border};border-radius:8px;padding:16px 18px;'
+        f'margin-bottom:16px;background:{bg};">'
+        f'<div style="font-size:15px;font-weight:600;color:{_HTML_COLORS["text"]};margin-bottom:4px;">{title_html}</div>'
+        f"{inner_html}</div>"
+    )
+
+
+def format_email_html(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, previous_rates,
+                       vcb_error=None, fawaz_error=None, fun_error=None, fxrates_error=None):
+    C = _HTML_COLORS
+    comparable = collect_comparable_rates(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates)
+    used_sources = [SOURCES[0]]
+
+    parts = []
+    parts.append(
+        f'<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;'
+        f'max-width:640px;margin:0 auto;color:{C["text"]};">'
+    )
+    parts.append(
+        f'<h1 style="font-size:20px;margin:0 0 4px;">Exchange rates to VND</h1>'
+        f'<div style="font-size:13px;color:{C["muted"]};margin-bottom:20px;">'
+        f"{now_vn().strftime('%Y-%m-%d %H:%M')} (Vietnam time)</div>"
+    )
+
+    # Best / lowest rate by source
+    best_rows = []
+    for code in WATCHLIST:
+        by_source = comparable.get(code, {})
+        if len(by_source) < 2:
+            continue
+        best_source, best_rate = max(by_source.items(), key=lambda kv: kv[1])
+        worst_source, worst_rate = min(by_source.items(), key=lambda kv: kv[1])
+        if best_source == worst_source:
+            continue
+        best_rows.append((
+            f"<strong>{_html_escape(code)}</strong>",
+            f'{best_rate:,.2f} <span style="color:{C["muted"]};font-size:12px;">({_html_escape(best_source)})</span>',
+            f'{worst_rate:,.2f} <span style="color:{C["muted"]};font-size:12px;">({_html_escape(worst_source)})</span>',
+        ))
+    if best_rows:
+        table = _html_source_table(best_rows, ["Currency", "Highest", "Lowest"])
+        parts.append(_html_card("Best / lowest rate by source", table))
+
+    # Discrepancy alert
+    disc_rows = []
+    for code in WATCHLIST:
+        by_source = comparable.get(code, {})
+        if len(by_source) < 2:
+            continue
+        max_rate, min_rate = max(by_source.values()), min(by_source.values())
+        spread_pct = (max_rate - min_rate) / min_rate * 100
+        if spread_pct >= DISCREPANCY_THRESHOLD_PERCENT:
+            disc_rows.append((f"<strong>{_html_escape(code)}</strong>", f"{spread_pct:.2f}%", f"{min_rate:,.2f} - {max_rate:,.2f} VND"))
+    if disc_rows:
+        table = _html_source_table(disc_rows, ["Currency", "Spread", "Range"])
+        parts.append(_html_card(
+            f"&#9888; Source discrepancy alert (&ge;{DISCREPANCY_THRESHOLD_PERCENT:.1f}%)",
+            table, bg=C["warn_bg"], border=C["warn_border"],
+        ))
+
+    # Market mid-rate
+    market_rows = []
+    for code, rate in rates.items():
+        change_cell = ""
+        if previous_rates and code in previous_rates:
+            prev = previous_rates[code]
+            pct = (rate - prev) / prev * 100
+            change_cell = _html_change_span(pct)
+        market_rows.append((f"<strong>{_html_escape(code)}</strong>", f"{rate:,.2f}", change_cell))
+    parts.append(_html_card("Market mid-rate", _html_source_table(market_rows, ["Currency", "1 unit = VND", "Change"])))
+
+    # Vietcombank
+    if vcb_rates:
+        vcb_rows = [
+            (f"<strong>{_html_escape(code)}</strong>", f"{vcb_rates[code]['buy']:,.2f}", f"{vcb_rates[code]['sell']:,.2f}")
+            for code in rates if code in vcb_rates
+        ]
+        parts.append(_html_card("Vietcombank official rate", _html_source_table(vcb_rows, ["Currency", "Buy (VND)", "Sell (VND)"])))
+        used_sources.append(SOURCES[1])
+    elif vcb_error:
+        parts.append(_html_card("Vietcombank official rate", f'<div style="color:{C["muted"]};font-size:13px;">Unavailable this run: {_html_escape(vcb_error)}</div>'))
+
+    # Independent aggregators
+    for label, source_rates, error, source_entry in [
+        ("fawazahmed0/currency-api (independent aggregator)", fawaz_rates, fawaz_error, SOURCES[2]),
+        ("exchangerate.fun (independent aggregator)", fun_rates, fun_error, SOURCES[3]),
+        ("fxratesapi.com (independent aggregator)", fxrates_rates, fxrates_error, SOURCES[4]),
+    ]:
+        if source_rates:
+            rows = [(f"<strong>{_html_escape(code)}</strong>", f"{source_rates[code]:,.2f}") for code in rates if code in source_rates]
+            parts.append(_html_card(label, _html_source_table(rows, ["Currency", "1 unit = VND"])))
+            used_sources.append(source_entry)
+        elif error:
+            parts.append(_html_card(label, f'<div style="color:{C["muted"]};font-size:13px;">Unavailable this run: {_html_escape(error)}</div>'))
+
+    # Quick conversions
+    if CONVERT_AMOUNTS_VND and rates:
+        conv_rows = []
+        for amount in CONVERT_AMOUNTS_VND:
+            parts_str = " &nbsp;|&nbsp; ".join(
+                f"{_html_escape(code)} {amount / rates[code]:,.2f}" for code in WATCHLIST if code in rates
+            )
+            conv_rows.append((f"{amount:,.0f} VND", parts_str))
+        table = _html_source_table(conv_rows, ["Amount", "Converts to"])
+        parts.append(_html_card("Quick conversions (market mid-rate)", table))
+
+    # Weekly trend
+    trend_rows = weekly_trend_rows()
+    if trend_rows:
+        rows = [(f"<strong>{_html_escape(r['code'])}</strong>", _html_change_span(r["pct"])) for r in trend_rows]
+        parts.append(_html_card("Weekly trend (7-day change)", _html_source_table(rows, ["Currency", "Change"])))
+
+    # Sources footer
+    source_links = " &nbsp;&middot;&nbsp; ".join(
+        f'<a href="{url}" style="color:{C["accent"]};text-decoration:none;">{_html_escape(name)}</a>'
+        for name, url in used_sources
+    )
+    parts.append(
+        f'<div style="font-size:12px;color:{C["muted"]};border-top:1px solid {C["border"]};padding-top:12px;margin-top:8px;">'
+        f"Sources: {source_links}</div>"
+    )
+
+    parts.append("</div>")
+    return "".join(parts)
+
+
 # --- Email --------------------------------------------------------------------
 
-def send_email(body):
-    msg = MIMEText(body)
+def send_email(body, html_body=None):
+    if html_body:
+        msg = MIMEMultipart("alternative")
+        msg.attach(MIMEText(body, "plain"))
+        msg.attach(MIMEText(html_body, "html"))
+    else:
+        msg = MIMEText(body)
+
     msg["Subject"] = f"Daily Exchange Rates -> VND - {now_vn().strftime('%Y-%m-%d %H:%M')}"
     msg["From"] = GMAIL_ADDRESS
     msg["To"] = CURRENCY_RECIPIENT
@@ -565,8 +762,12 @@ def cmd_generate():
 
     body = format_email_body(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, previous_rates,
                               vcb_error, fawaz_error, fun_error, fxrates_error)
+    html_body = format_email_html(rates, vcb_rates, fawaz_rates, fun_rates, fxrates_rates, previous_rates,
+                                   vcb_error, fawaz_error, fun_error, fxrates_error)
     with open(EMAIL_BODY_FILE, "w") as f:
         f.write(body)
+    with open(EMAIL_HTML_FILE, "w") as f:
+        f.write(html_body)
 
     print(body)
     save_rates(rates)
@@ -585,11 +786,16 @@ def cmd_send():
         print("Email body empty, nothing to send.")
         return
 
+    html_body = None
+    if os.path.exists(EMAIL_HTML_FILE):
+        with open(EMAIL_HTML_FILE) as f:
+            html_body = f.read().strip() or None
+
     if not (GMAIL_ADDRESS and GMAIL_APP_PASSWORD and CURRENCY_RECIPIENT):
         print("GMAIL_ADDRESS / GMAIL_APP_PASSWORD / CURRENCY_RECIPIENT not set, skipping send.")
         return
 
-    send_email(body)
+    send_email(body, html_body)
     print("Email sent.")
 
 
