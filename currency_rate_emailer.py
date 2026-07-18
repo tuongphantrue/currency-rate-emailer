@@ -103,6 +103,14 @@ FAWAZ_FALLBACK_URL = "https://latest.currency-api.pages.dev/v1/currencies/vnd.js
 # fxratesapi.com: free, no key needed for the latest-rates endpoint (per their docs/npm wrapper).
 FXRATES_API_URL = "https://api.fxratesapi.com/latest"
 
+# CoinGecko's free/no-key Demo API. CoinGecko doesn't publish direct fiat-to-fiat
+# rates, so we derive them via Tether (USDT) — a stablecoin designed to track USD
+# 1:1 — comparing its market price in VND against its market price in each other
+# currency. This is a real, commonly-used technique, but it inherits small crypto-
+# market pricing noise (typically well under 0.5%) rather than being a pure
+# interbank FX rate. The card for this source says so explicitly.
+COINGECKO_API_URL = "https://api.coingecko.com/api/v3/simple/price"
+
 # Sent with every request. Several of these hosts block the bare default
 # "python-requests/x.y" User-Agent, so we look like an ordinary browser instead.
 HEADERS = {
@@ -149,6 +157,7 @@ SOURCES = [
     ("Vietcombank official rate", "https://www.vietcombank.com.vn/en-us/personal/support/exchange-rates"),
     ("fawazahmed0/currency-api", "https://github.com/fawazahmed0/currency-api"),
     ("fxratesapi.com", "https://fxratesapi.com/"),
+    ("CoinGecko (via USDT)", "https://www.coingecko.com/en/api"),
 ]
 
 EMAIL_BODY_FILE = "email_body.txt"
@@ -270,6 +279,36 @@ def fetch_fxrates_rates():
     return rates
 
 
+def fetch_coingecko_rates():
+    """Returns {currency_code: VND_per_unit} derived from CoinGecko's Tether (USDT)
+    market price in each currency. USDT is a stablecoin designed to track USD 1:1,
+    so its price in VND vs. its price in another currency gives a usable cross-rate:
+    VND per 1 X = USDT_price_in_VND / USDT_price_in_X.
+
+    This is a real, commonly-used technique, but it inherits small crypto-market
+    pricing noise (typically well under 0.5%) rather than being a pure interbank
+    FX rate — the email card for this source says so explicitly.
+    """
+    vs_currencies = ",".join(c.lower() for c in WATCHLIST if c != "VND")
+    params = {"ids": "tether", "vs_currencies": f"{vs_currencies},vnd"}
+    resp = get_with_retry(COINGECKO_API_URL, headers=HEADERS, params=params, timeout=15)
+    data = resp.json()
+
+    usdt_prices = data.get("tether", {})
+    vnd_per_usdt = usdt_prices.get("vnd")
+    if not vnd_per_usdt:
+        raise RuntimeError("VND not present in CoinGecko response")
+
+    rates = {}
+    for code in WATCHLIST:
+        if code == "VND":
+            continue
+        price_in_code = usdt_prices.get(code.lower())
+        if price_in_code:
+            rates[code] = vnd_per_usdt / price_in_code
+    return rates
+
+
 # --- State (for % change + threshold) --------------------------------------
 
 def load_previous_rates():
@@ -363,7 +402,7 @@ def weekly_trend_rows():
 
 # --- Best-rate + discrepancy analysis ----------------------------------------
 
-def collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates):
+def collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates):
     """Builds {currency: {source_name: vnd_per_unit}} across all successful sources.
     VCB contributes the average of its buy/sell as a single comparable figure.
     """
@@ -381,6 +420,9 @@ def collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates):
 
     for code, rate in fxrates_rates.items():
         comparable[code][SOURCES[3][0]] = rate
+
+    for code, rate in coingecko_rates.items():
+        comparable[code][SOURCES[4][0]] = rate
 
     return comparable
 
@@ -455,11 +497,11 @@ def conversion_section(rates):
 
 # --- Formatting -------------------------------------------------------------
 
-def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, previous_rates,
-                       vcb_error=None, fawaz_error=None, fxrates_error=None):
+def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
+                       vcb_error=None, fawaz_error=None, fxrates_error=None, coingecko_error=None):
     lines = [f"Exchange rates to VND - {now_vn().strftime('%Y-%m-%d %H:%M')}\n"]
 
-    comparable = collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates)
+    comparable = collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates)
 
     best = best_rate_section(comparable)
     if best:
@@ -531,6 +573,23 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, previous_rat
         lines.append(f"fxratesapi.com: unavailable this run ({fxrates_error})")
         lines.append(f"(source: {SOURCES[3][0]} - {SOURCES[3][1]})")
 
+    if coingecko_rates:
+        lines.append("")
+        lines.append("CoinGecko, via USDT (derived, not a direct FX source)")
+        lines.append(f"(source: {SOURCES[4][0]} - {SOURCES[4][1]})")
+        lines.append("(computed from Tether's market price in VND vs. each currency;")
+        lines.append(" inherits small crypto-market pricing noise, usually <0.5%)")
+        lines.append(f"{'Currency':<14}{'1 unit = VND'}")
+        lines.append("-" * 38)
+        for code in rates:
+            if code in coingecko_rates:
+                lines.append(f"{label_for(code):<14}{coingecko_rates[code]:,.2f}")
+        used_sources.append(SOURCES[4])
+    elif coingecko_error:
+        lines.append("")
+        lines.append(f"CoinGecko (via USDT): unavailable this run ({coingecko_error})")
+        lines.append(f"(source: {SOURCES[4][0]} - {SOURCES[4][1]})")
+
     conversions = conversion_section(rates)
     if conversions:
         lines.append("")
@@ -574,6 +633,7 @@ SECTION_ACCENTS = {
     "vcb": "#00693e",          # Vietcombank's own brand green
     "fawaz": "#7c3aed",        # purple
     "fxrates": "#ea580c",      # orange
+    "coingecko": "#f59e0b",    # gold/amber (crypto-ish, distinct from discrepancy's amber)
     "conversions": "#4f46e5",  # indigo
     "trend": "#db2777",        # rose
 }
@@ -684,10 +744,10 @@ def _html_source_link(name, url):
     return f'Source: <a href="{url}" style="color:{_HTML_COLORS["accent"]};text-decoration:none;">{_html_escape(name)}</a>'
 
 
-def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, previous_rates,
-                       vcb_error=None, fawaz_error=None, fxrates_error=None):
+def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
+                       vcb_error=None, fawaz_error=None, fxrates_error=None, coingecko_error=None):
     C = _HTML_COLORS
-    comparable = collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates)
+    comparable = collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates)
     used_sources = [SOURCES[0]]
 
     parts = []
@@ -807,6 +867,31 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, previous_rat
                 accent=accent,
             ))
 
+    # CoinGecko (via USDT) — kept separate from the aggregator loop since it needs
+    # its own caveat note about being derived, not a direct FX rate.
+    coingecko_accent = SECTION_ACCENTS["coingecko"]
+    if coingecko_rates:
+        rows = [(f"<strong>{_html_label(code)}</strong>", f"{coingecko_rates[code]:,.2f}") for code in rates if code in coingecko_rates]
+        caveat = (
+            f'<div style="font-size:12px;color:{C["muted"]};margin-bottom:10px;">'
+            f"Derived from Tether (USDT)'s market price in VND vs. each currency &mdash; "
+            f"not a direct FX rate, inherits small crypto-market pricing noise (usually &lt;0.5%).</div>"
+        )
+        parts.append(_html_card(
+            "CoinGecko (via USDT)",
+            caveat + _html_source_table(rows, ["Currency", "1 unit = VND"], accent=coingecko_accent),
+            _html_source_link(*SOURCES[4]),
+            accent=coingecko_accent,
+        ))
+        used_sources.append(SOURCES[4])
+    elif coingecko_error:
+        parts.append(_html_card(
+            "CoinGecko (via USDT)",
+            f'<div style="color:{C["muted"]};font-size:13px;">Unavailable this run: {_html_escape(coingecko_error)}</div>',
+            _html_source_link(*SOURCES[4]),
+            accent=coingecko_accent,
+        ))
+
     # Quick conversions
     if CONVERT_AMOUNTS_VND and rates:
         amount_headers = [f"{a:,.0f} VND" for a in CONVERT_AMOUNTS_VND]
@@ -906,10 +991,18 @@ def cmd_generate():
         fxrates_rates = {}
         fxrates_error = str(e)
 
-    body = format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, previous_rates,
-                              vcb_error, fawaz_error, fxrates_error)
-    html_body = format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, previous_rates,
-                                   vcb_error, fawaz_error, fxrates_error)
+    try:
+        coingecko_rates = fetch_coingecko_rates()
+        coingecko_error = None
+    except Exception as e:
+        print(f"CoinGecko source failed ({e}), continuing without it.")
+        coingecko_rates = {}
+        coingecko_error = str(e)
+
+    body = format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
+                              vcb_error, fawaz_error, fxrates_error, coingecko_error)
+    html_body = format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
+                                   vcb_error, fawaz_error, fxrates_error, coingecko_error)
     with open(EMAIL_BODY_FILE, "w") as f:
         f.write(body)
     with open(EMAIL_HTML_FILE, "w") as f:
