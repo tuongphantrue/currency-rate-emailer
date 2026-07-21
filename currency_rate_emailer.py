@@ -329,10 +329,20 @@ def fetch_coingecko_rates():
 # --- State (for % change + threshold) --------------------------------------
 
 def load_previous_rates():
+    """Returns the last run's market rates, or None if there's no usable history yet
+    (file missing, empty, or unreadable — e.g. left over from an older, incompatible
+    version of this script). A bad state file should degrade to "no history" rather
+    than crash the whole run.
+    """
     if not os.path.exists(STATE_FILE):
         return None
-    with open(STATE_FILE) as f:
-        return json.load(f)
+    try:
+        with open(STATE_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) and data else None
+    except (json.JSONDecodeError, ValueError, OSError) as e:
+        print(f"Warning: could not read {STATE_FILE} ({e}), treating as no history.")
+        return None
 
 
 def save_rates(rates):
