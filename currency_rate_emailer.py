@@ -178,6 +178,7 @@ SOURCE_DESCRIPTIONS = [
 
 EMAIL_BODY_FILE = "email_body.txt"
 EMAIL_HTML_FILE = "email_body.html"
+EMAIL_SUBJECT_FILE = "email_subject.txt"
 STATE_FILE = "last_rates.json"
 HISTORY_FILE = "rate_history.csv"
 
@@ -514,7 +515,8 @@ def conversion_section(rates):
 # --- Formatting -------------------------------------------------------------
 
 def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
-                       vcb_error=None, fawaz_error=None, fxrates_error=None, coingecko_error=None):
+                       vcb_error=None, fawaz_error=None, fxrates_error=None, coingecko_error=None,
+                       market_error=None):
     lines = [f"Tỷ giá quy đổi sang VND - {now_vn().strftime('%Y-%m-%d %H:%M')}\n"]
 
     comparable = collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates)
@@ -527,21 +529,26 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
     if discrepancy:
         lines += discrepancy + [""]
 
-    lines.append("Tỷ giá trung bình thị trường")
-    lines.append(f"(nguồn: {SOURCES[0][0]} - {SOURCES[0][1]})")
-    lines.append(f"{SOURCE_DESCRIPTIONS[0]}")
-    lines.append(f"{'Loại tiền':<14}{'1 đơn vị = VND':<18}{'Thay đổi'}")
-    lines.append("-" * 38)
-    for code, rate in rates.items():
-        change_str = ""
-        if previous_rates and code in previous_rates:
-            prev = previous_rates[code]
-            pct = (rate - prev) / prev * 100
-            arrow = "TĂNG" if pct > 0 else ("GIẢM" if pct < 0 else "KHÔNG ĐỔI")
-            change_str = f"{arrow} {pct:+.2f}%"
-        lines.append(f"{label_for(code):<14}{rate:,.2f}{'':<6}{change_str}")
+    used_sources = []
 
-    used_sources = [SOURCES[0]]  # market mid-rate always used if we got this far
+    if rates:
+        lines.append("Tỷ giá trung bình thị trường")
+        lines.append(f"(nguồn: {SOURCES[0][0]} - {SOURCES[0][1]})")
+        lines.append(f"{SOURCE_DESCRIPTIONS[0]}")
+        lines.append(f"{'Loại tiền':<14}{'1 đơn vị = VND':<18}{'Thay đổi'}")
+        lines.append("-" * 38)
+        for code, rate in rates.items():
+            change_str = ""
+            if previous_rates and code in previous_rates:
+                prev = previous_rates[code]
+                pct = (rate - prev) / prev * 100
+                arrow = "TĂNG" if pct > 0 else ("GIẢM" if pct < 0 else "KHÔNG ĐỔI")
+                change_str = f"{arrow} {pct:+.2f}%"
+            lines.append(f"{label_for(code):<14}{rate:,.2f}{'':<6}{change_str}")
+        used_sources.append(SOURCES[0])
+    elif market_error:
+        lines.append(f"Tỷ giá trung bình thị trường: không khả dụng lần này ({market_error})")
+        lines.append(f"(nguồn: {SOURCES[0][0]} - {SOURCES[0][1]})")
 
     if vcb_rates:
         lines.append("")
@@ -550,7 +557,7 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         lines.append(f"{SOURCE_DESCRIPTIONS[1]}")
         lines.append(f"{'Loại tiền':<14}{'Mua (VND)':<16}{'Bán (VND)'}")
         lines.append("-" * 38)
-        for code in rates:
+        for code in WATCHLIST:
             if code in vcb_rates:
                 buy = vcb_rates[code]["buy"]
                 sell = vcb_rates[code]["sell"]
@@ -568,7 +575,7 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         lines.append(f"{SOURCE_DESCRIPTIONS[2]}")
         lines.append(f"{'Loại tiền':<14}{'1 đơn vị = VND'}")
         lines.append("-" * 38)
-        for code in rates:
+        for code in WATCHLIST:
             if code in fawaz_rates:
                 lines.append(f"{label_for(code):<14}{fawaz_rates[code]:,.2f}")
         used_sources.append(SOURCES[2])
@@ -584,7 +591,7 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         lines.append(f"{SOURCE_DESCRIPTIONS[3]}")
         lines.append(f"{'Loại tiền':<14}{'1 đơn vị = VND'}")
         lines.append("-" * 38)
-        for code in rates:
+        for code in WATCHLIST:
             if code in fxrates_rates:
                 lines.append(f"{label_for(code):<14}{fxrates_rates[code]:,.2f}")
         used_sources.append(SOURCES[3])
@@ -601,7 +608,7 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         lines.append("Không phải tỷ giá trực tiếp — có sai số nhỏ do biến động giá tiền điện tử (thường dưới 0.5%).")
         lines.append(f"{'Loại tiền':<14}{'1 đơn vị = VND'}")
         lines.append("-" * 38)
-        for code in rates:
+        for code in WATCHLIST:
             if code in coingecko_rates:
                 lines.append(f"{label_for(code):<14}{coingecko_rates[code]:,.2f}")
         used_sources.append(SOURCES[4])
@@ -773,10 +780,11 @@ def _html_source_link(name, url):
 
 
 def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
-                       vcb_error=None, fawaz_error=None, fxrates_error=None, coingecko_error=None):
+                       vcb_error=None, fawaz_error=None, fxrates_error=None, coingecko_error=None,
+                       market_error=None):
     C = _HTML_COLORS
     comparable = collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates)
-    used_sources = [SOURCES[0]]
+    used_sources = []
 
     parts = []
     parts.append(
@@ -836,27 +844,36 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         ))
 
     # Market mid-rate
-    market_rows = []
-    for code, rate in rates.items():
-        change_cell = ""
-        if previous_rates and code in previous_rates:
-            prev = previous_rates[code]
-            pct = (rate - prev) / prev * 100
-            change_cell = _html_change_span(pct)
-        market_rows.append((f"<strong>{_html_label(code)}</strong>", f"{rate:,.2f}", change_cell))
-    parts.append(_html_card(
-        "Tỷ giá trung bình thị trường",
-        _html_source_table(market_rows, ["Loại tiền", "1 đơn vị = VND", "Thay đổi"], accent=SECTION_ACCENTS["market"]),
-        _html_source_link(*SOURCES[0]),
-        accent=SECTION_ACCENTS["market"],
-        description=SOURCE_DESCRIPTIONS[0],
-    ))
+    if rates:
+        market_rows = []
+        for code, rate in rates.items():
+            change_cell = ""
+            if previous_rates and code in previous_rates:
+                prev = previous_rates[code]
+                pct = (rate - prev) / prev * 100
+                change_cell = _html_change_span(pct)
+            market_rows.append((f"<strong>{_html_label(code)}</strong>", f"{rate:,.2f}", change_cell))
+        parts.append(_html_card(
+            "Tỷ giá trung bình thị trường",
+            _html_source_table(market_rows, ["Loại tiền", "1 đơn vị = VND", "Thay đổi"], accent=SECTION_ACCENTS["market"]),
+            _html_source_link(*SOURCES[0]),
+            accent=SECTION_ACCENTS["market"],
+            description=SOURCE_DESCRIPTIONS[0],
+        ))
+        used_sources.append(SOURCES[0])
+    elif market_error:
+        parts.append(_html_card(
+            "Tỷ giá trung bình thị trường",
+            f'<div style="color:{C["muted"]};font-size:13px;">Không khả dụng lần này: {_html_escape(market_error)}</div>',
+            _html_source_link(*SOURCES[0]),
+            accent=SECTION_ACCENTS["market"],
+        ))
 
     # Vietcombank
     if vcb_rates:
         vcb_rows = [
             (f"<strong>{_html_label(code)}</strong>", f"{vcb_rates[code]['buy']:,.2f}", f"{vcb_rates[code]['sell']:,.2f}")
-            for code in rates if code in vcb_rates
+            for code in WATCHLIST if code in vcb_rates
         ]
         parts.append(_html_card(
             "Tỷ giá chính thức Vietcombank",
@@ -882,7 +899,7 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         accent = SECTION_ACCENTS[accent_key]
         desc = SOURCE_DESCRIPTIONS[SOURCES.index(source_entry)]
         if source_rates:
-            rows = [(f"<strong>{_html_label(code)}</strong>", f"{source_rates[code]:,.2f}") for code in rates if code in source_rates]
+            rows = [(f"<strong>{_html_label(code)}</strong>", f"{source_rates[code]:,.2f}") for code in WATCHLIST if code in source_rates]
             parts.append(_html_card(
                 f"{label} (nguồn tổng hợp độc lập)",
                 _html_source_table(rows, ["Loại tiền", "1 đơn vị = VND"], accent=accent),
@@ -903,7 +920,7 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
     # its own caveat note about being derived, not a direct FX rate.
     coingecko_accent = SECTION_ACCENTS["coingecko"]
     if coingecko_rates:
-        rows = [(f"<strong>{_html_label(code)}</strong>", f"{coingecko_rates[code]:,.2f}") for code in rates if code in coingecko_rates]
+        rows = [(f"<strong>{_html_label(code)}</strong>", f"{coingecko_rates[code]:,.2f}") for code in WATCHLIST if code in coingecko_rates]
         parts.append(_html_card(
             "CoinGecko (qua USDT)",
             _html_source_table(rows, ["Loại tiền", "1 đơn vị = VND"], accent=coingecko_accent),
@@ -967,7 +984,7 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
 
 # --- Email --------------------------------------------------------------------
 
-def send_email(body, html_body=None):
+def send_email(body, html_body=None, subject=None):
     if html_body:
         msg = MIMEMultipart("alternative")
         msg.attach(MIMEText(body, "plain", "utf-8"))
@@ -975,7 +992,7 @@ def send_email(body, html_body=None):
     else:
         msg = MIMEText(body, "plain", "utf-8")
 
-    msg["Subject"] = f"Tỷ giá quy đổi sang VND - {now_vn().strftime('%Y-%m-%d %H:%M')}"
+    msg["Subject"] = subject or f"Tỷ giá quy đổi sang VND - {now_vn().strftime('%Y-%m-%d %H:%M')}"
     msg["From"] = GMAIL_ADDRESS
     msg["To"] = CURRENCY_RECIPIENT
 
@@ -985,13 +1002,72 @@ def send_email(body, html_body=None):
         server.sendmail(GMAIL_ADDRESS, [CURRENCY_RECIPIENT], msg.as_string())
 
 
+# --- Total-failure alert -----------------------------------------------------
+# If every single source fails in the same run, the normal digest would be
+# nearly empty and easy to miss. Build a short, distinct alert instead.
+
+def build_alert_body_text(errors):
+    """errors: list of (source_name, error_message) for every failed source."""
+    lines = [
+        f"CẢNH BÁO: Không lấy được tỷ giá từ bất kỳ nguồn nào - {now_vn().strftime('%Y-%m-%d %H:%M')}",
+        "",
+        "Cả 5 nguồn dữ liệu đều gặp lỗi trong lần chạy này, nên không có tỷ giá nào để gửi.",
+        "",
+        "Chi tiết lỗi từng nguồn:",
+    ]
+    for name, error in errors:
+        lines.append(f"- {name}: {error}")
+    lines += [
+        "",
+        "Hãy kiểm tra lại kết nối mạng của GitHub Actions runner, hoặc trạng thái hiện tại của từng API.",
+        "Nếu chỉ một vài nguồn lỗi (không phải tất cả), email tỷ giá bình thường vẫn được gửi như thường lệ.",
+    ]
+    return "\n".join(lines)
+
+
+def build_alert_body_html(errors):
+    C = _HTML_COLORS
+    rows = "".join(
+        f'<div style="padding:6px 0;border-bottom:1px solid {C["border"]};font-size:14px;">'
+        f'<strong>{_html_escape(name)}</strong>: <span style="color:{C["muted"]};">{_html_escape(error)}</span></div>'
+        for name, error in errors
+    )
+    return (
+        f'<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;'
+        f'max-width:640px;margin:0 auto;color:{C["text"]};">'
+        f'<div style="background:{C["down"]};border-radius:10px;padding:20px 22px;margin-bottom:20px;">'
+        f'<h1 style="font-size:20px;margin:0 0 4px;color:#ffffff;">&#128680; Cảnh báo: Tất cả nguồn tỷ giá đều lỗi</h1>'
+        f'<div style="font-size:13px;color:#fee2e2;">{now_vn().strftime("%Y-%m-%d %H:%M")} (giờ Việt Nam)</div>'
+        f'</div>'
+        f'<div style="border:1px solid {C["border"]};border-radius:8px;padding:16px 18px;">'
+        f'<div style="font-size:14px;margin-bottom:12px;">Cả 5 nguồn dữ liệu đều gặp lỗi trong lần chạy này, '
+        f'nên không có tỷ giá nào để gửi.</div>'
+        f'{rows}'
+        f'<div style="font-size:12.5px;color:{C["muted"]};margin-top:14px;">Hãy kiểm tra lại kết nối mạng của '
+        f'GitHub Actions runner, hoặc trạng thái hiện tại của từng API. Nếu chỉ một vài nguồn lỗi (không phải '
+        f'tất cả), email tỷ giá bình thường vẫn được gửi như thường lệ.</div>'
+        f'</div></div>'
+    )
+
+
 # --- Commands -----------------------------------------------------------------
 
 def cmd_generate():
-    rates = fetch_market_rates()
+    try:
+        rates = fetch_market_rates()
+        market_error = None
+    except Exception as e:
+        print(f"Market mid-rate source failed ({e}), continuing without it.")
+        rates = {}
+        market_error = str(e)
+
     previous_rates = load_previous_rates()
 
-    if not should_send(rates, previous_rates):
+    # Only apply the "skip if no significant change" logic when we actually have
+    # a market rate to compare against — if the market source itself failed, we
+    # always proceed, so a total-failure alert or partial digest isn't silently
+    # skipped by a threshold check that has nothing to compare.
+    if rates and not should_send(rates, previous_rates):
         print("No significant change, skipping email.")
         open(EMAIL_BODY_FILE, "w").close()
         return
@@ -1028,18 +1104,50 @@ def cmd_generate():
         coingecko_rates = {}
         coingecko_error = str(e)
 
+    all_rate_dicts = [rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates]
+    success_count = sum(1 for r in all_rate_dicts if r)
+
+    if success_count == 0:
+        # Total failure: every source failed. Send a short, distinct alert
+        # instead of a near-empty digest, so it doesn't get missed.
+        print("ALERT: all 5 sources failed this run.")
+        errors = [
+            (SOURCES[0][0], market_error),
+            (SOURCES[1][0], vcb_error),
+            (SOURCES[2][0], fawaz_error),
+            (SOURCES[3][0], fxrates_error),
+            (SOURCES[4][0], coingecko_error),
+        ]
+        body = build_alert_body_text(errors)
+        html_body = build_alert_body_html(errors)
+        subject = f"🚨 CẢNH BÁO: Tất cả nguồn tỷ giá đều lỗi - {now_vn().strftime('%Y-%m-%d %H:%M')}"
+        with open(EMAIL_BODY_FILE, "w") as f:
+            f.write(body)
+        with open(EMAIL_HTML_FILE, "w") as f:
+            f.write(html_body)
+        with open(EMAIL_SUBJECT_FILE, "w") as f:
+            f.write(subject)
+        print(body)
+        # No new data was fetched — don't overwrite the rate cache or history.
+        return
+
     body = format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
-                              vcb_error, fawaz_error, fxrates_error, coingecko_error)
+                              vcb_error, fawaz_error, fxrates_error, coingecko_error, market_error)
     html_body = format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
-                                   vcb_error, fawaz_error, fxrates_error, coingecko_error)
+                                   vcb_error, fawaz_error, fxrates_error, coingecko_error, market_error)
     with open(EMAIL_BODY_FILE, "w") as f:
         f.write(body)
     with open(EMAIL_HTML_FILE, "w") as f:
         f.write(html_body)
+    # Clear any leftover alert subject from a previous failed run, so a normal
+    # run always uses the normal subject format.
+    if os.path.exists(EMAIL_SUBJECT_FILE):
+        os.remove(EMAIL_SUBJECT_FILE)
 
     print(body)
-    save_rates(rates)
-    append_history(rates)
+    if rates:
+        save_rates(rates)
+        append_history(rates)
 
 
 def cmd_send():
@@ -1059,11 +1167,16 @@ def cmd_send():
         with open(EMAIL_HTML_FILE) as f:
             html_body = f.read().strip() or None
 
+    subject = None
+    if os.path.exists(EMAIL_SUBJECT_FILE):
+        with open(EMAIL_SUBJECT_FILE) as f:
+            subject = f.read().strip() or None
+
     if not (GMAIL_ADDRESS and GMAIL_APP_PASSWORD and CURRENCY_RECIPIENT):
         print("GMAIL_ADDRESS / GMAIL_APP_PASSWORD / CURRENCY_RECIPIENT not set, skipping send.")
         return
 
-    send_email(body, html_body)
+    send_email(body, html_body, subject)
     print("Email sent.")
 
 
