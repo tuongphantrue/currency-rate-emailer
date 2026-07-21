@@ -533,7 +533,7 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
 
     if rates:
         lines.append("Tỷ giá trung bình thị trường")
-        lines.append(f"(nguồn: {SOURCES[0][0]} - {SOURCES[0][1]})")
+        lines.append(f"(nguồn: {SOURCES[0][0]})")
         lines.append(f"{SOURCE_DESCRIPTIONS[0]}")
         lines.append(f"{'Loại tiền':<14}{'1 đơn vị = VND':<18}{'Thay đổi'}")
         lines.append("-" * 38)
@@ -548,12 +548,12 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         used_sources.append(SOURCES[0])
     elif market_error:
         lines.append(f"Tỷ giá trung bình thị trường: không khả dụng lần này ({market_error})")
-        lines.append(f"(nguồn: {SOURCES[0][0]} - {SOURCES[0][1]})")
+        lines.append(f"(nguồn: {SOURCES[0][0]})")
 
     if vcb_rates:
         lines.append("")
         lines.append("Tỷ giá chính thức Vietcombank")
-        lines.append(f"(nguồn: {SOURCES[1][0]} - {SOURCES[1][1]})")
+        lines.append(f"(nguồn: {SOURCES[1][0]})")
         lines.append(f"{SOURCE_DESCRIPTIONS[1]}")
         lines.append(f"{'Loại tiền':<14}{'Mua (VND)':<16}{'Bán (VND)'}")
         lines.append("-" * 38)
@@ -566,12 +566,12 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
     elif vcb_error:
         lines.append("")
         lines.append(f"Tỷ giá chính thức Vietcombank: không khả dụng lần này ({vcb_error})")
-        lines.append(f"(nguồn: {SOURCES[1][0]} - {SOURCES[1][1]})")
+        lines.append(f"(nguồn: {SOURCES[1][0]})")
 
     if fawaz_rates:
         lines.append("")
         lines.append("fawazahmed0/currency-api (nguồn tổng hợp độc lập)")
-        lines.append(f"(nguồn: {SOURCES[2][0]} - {SOURCES[2][1]})")
+        lines.append(f"(nguồn: {SOURCES[2][0]})")
         lines.append(f"{SOURCE_DESCRIPTIONS[2]}")
         lines.append(f"{'Loại tiền':<14}{'1 đơn vị = VND'}")
         lines.append("-" * 38)
@@ -582,12 +582,12 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
     elif fawaz_error:
         lines.append("")
         lines.append(f"fawazahmed0/currency-api: không khả dụng lần này ({fawaz_error})")
-        lines.append(f"(nguồn: {SOURCES[2][0]} - {SOURCES[2][1]})")
+        lines.append(f"(nguồn: {SOURCES[2][0]})")
 
     if fxrates_rates:
         lines.append("")
         lines.append("fxratesapi.com (nguồn tổng hợp độc lập)")
-        lines.append(f"(nguồn: {SOURCES[3][0]} - {SOURCES[3][1]})")
+        lines.append(f"(nguồn: {SOURCES[3][0]})")
         lines.append(f"{SOURCE_DESCRIPTIONS[3]}")
         lines.append(f"{'Loại tiền':<14}{'1 đơn vị = VND'}")
         lines.append("-" * 38)
@@ -598,12 +598,12 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
     elif fxrates_error:
         lines.append("")
         lines.append(f"fxratesapi.com: không khả dụng lần này ({fxrates_error})")
-        lines.append(f"(nguồn: {SOURCES[3][0]} - {SOURCES[3][1]})")
+        lines.append(f"(nguồn: {SOURCES[3][0]})")
 
     if coingecko_rates:
         lines.append("")
         lines.append("CoinGecko, qua USDT (được suy ra, không phải nguồn tỷ giá trực tiếp)")
-        lines.append(f"(nguồn: {SOURCES[4][0]} - {SOURCES[4][1]})")
+        lines.append(f"(nguồn: {SOURCES[4][0]})")
         lines.append(f"{SOURCE_DESCRIPTIONS[4]}")
         lines.append("Không phải tỷ giá trực tiếp — có sai số nhỏ do biến động giá tiền điện tử (thường dưới 0.5%).")
         lines.append(f"{'Loại tiền':<14}{'1 đơn vị = VND'}")
@@ -615,7 +615,7 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
     elif coingecko_error:
         lines.append("")
         lines.append(f"CoinGecko (qua USDT): không khả dụng lần này ({coingecko_error})")
-        lines.append(f"(nguồn: {SOURCES[4][0]} - {SOURCES[4][1]})")
+        lines.append(f"(nguồn: {SOURCES[4][0]})")
 
     conversions = conversion_section(rates)
     if conversions:
@@ -775,8 +775,11 @@ def _html_card(title_html, inner_html, source_html, accent=None, bg=None, border
     )
 
 
-def _html_source_link(name, url):
-    return f'Nguồn: <a href="{url}" style="color:{_HTML_COLORS["accent"]};text-decoration:none;">{_html_escape(name)}</a>'
+def _html_source_label(name, url):
+    """Plain-text source attribution for inside a card — no link here. The
+    actual clickable URL appears once, in the consolidated footer at the very
+    end of the email, instead of being repeated as a link on every card."""
+    return f"Nguồn: {_html_escape(name)}"
 
 
 def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
@@ -856,7 +859,7 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         parts.append(_html_card(
             "Tỷ giá trung bình thị trường",
             _html_source_table(market_rows, ["Loại tiền", "1 đơn vị = VND", "Thay đổi"], accent=SECTION_ACCENTS["market"]),
-            _html_source_link(*SOURCES[0]),
+            _html_source_label(*SOURCES[0]),
             accent=SECTION_ACCENTS["market"],
             description=SOURCE_DESCRIPTIONS[0],
         ))
@@ -865,7 +868,7 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         parts.append(_html_card(
             "Tỷ giá trung bình thị trường",
             f'<div style="color:{C["muted"]};font-size:13px;">Không khả dụng lần này: {_html_escape(market_error)}</div>',
-            _html_source_link(*SOURCES[0]),
+            _html_source_label(*SOURCES[0]),
             accent=SECTION_ACCENTS["market"],
         ))
 
@@ -878,7 +881,7 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         parts.append(_html_card(
             "Tỷ giá chính thức Vietcombank",
             _html_source_table(vcb_rows, ["Loại tiền", "Mua (VND)", "Bán (VND)"], accent=SECTION_ACCENTS["vcb"]),
-            _html_source_link(*SOURCES[1]),
+            _html_source_label(*SOURCES[1]),
             accent=SECTION_ACCENTS["vcb"],
             description=SOURCE_DESCRIPTIONS[1],
         ))
@@ -887,7 +890,7 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         parts.append(_html_card(
             "Tỷ giá chính thức Vietcombank",
             f'<div style="color:{C["muted"]};font-size:13px;">Không khả dụng lần này: {_html_escape(vcb_error)}</div>',
-            _html_source_link(*SOURCES[1]),
+            _html_source_label(*SOURCES[1]),
             accent=SECTION_ACCENTS["vcb"],
         ))
 
@@ -903,7 +906,7 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
             parts.append(_html_card(
                 f"{label} (nguồn tổng hợp độc lập)",
                 _html_source_table(rows, ["Loại tiền", "1 đơn vị = VND"], accent=accent),
-                _html_source_link(*source_entry),
+                _html_source_label(*source_entry),
                 accent=accent,
                 description=desc,
             ))
@@ -912,7 +915,7 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
             parts.append(_html_card(
                 f"{label} (nguồn tổng hợp độc lập)",
                 f'<div style="color:{C["muted"]};font-size:13px;">Không khả dụng lần này: {_html_escape(error)}</div>',
-                _html_source_link(*source_entry),
+                _html_source_label(*source_entry),
                 accent=accent,
             ))
 
@@ -924,7 +927,7 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         parts.append(_html_card(
             "CoinGecko (qua USDT)",
             _html_source_table(rows, ["Loại tiền", "1 đơn vị = VND"], accent=coingecko_accent),
-            _html_source_link(*SOURCES[4]),
+            _html_source_label(*SOURCES[4]),
             accent=coingecko_accent,
             description=SOURCE_DESCRIPTIONS[4] + " Không phải tỷ giá trực tiếp — có sai số nhỏ "
                         "do biến động giá tiền điện tử (thường dưới 0.5%).",
@@ -934,7 +937,7 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         parts.append(_html_card(
             "CoinGecko (qua USDT)",
             f'<div style="color:{C["muted"]};font-size:13px;">Không khả dụng lần này: {_html_escape(coingecko_error)}</div>',
-            _html_source_link(*SOURCES[4]),
+            _html_source_label(*SOURCES[4]),
             accent=coingecko_accent,
         ))
 
