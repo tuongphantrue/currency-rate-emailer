@@ -482,6 +482,38 @@ def discrepancy_section(comparable):
             "(so sánh giữa các nguồn bên dưới, theo từng loại tiền)"] + ["-" * 38] + lines
 
 
+# Short labels for SOURCES, used only in the side-by-side comparison table where
+# full names would make columns too wide. Indexed the same way as SOURCES.
+SOURCE_SHORT_NAMES = ["TB thị trường", "Vietcombank", "fawazahmed0", "fxratesapi", "CoinGecko"]
+
+
+def all_sources_table_section(comparable):
+    """A single table with every source's rate for every currency, side by side,
+    so all sources can be compared at a glance instead of scrolling through each
+    source's own card. Vietcombank shows the average of its buy/sell rate here,
+    same as it's treated elsewhere for cross-source comparison.
+    """
+    if not any(comparable.get(code) for code in WATCHLIST):
+        return None
+
+    col_width = 15
+    lines = ["Bảng so sánh tất cả các nguồn", "(Vietcombank hiển thị giá trị trung bình mua/bán)"]
+    header = f"{'Loại tiền':<14}" + "".join(f"{name:<{col_width}}" for name in SOURCE_SHORT_NAMES)
+    lines.append(header)
+    lines.append("-" * len(header))
+    for code in WATCHLIST:
+        by_source = comparable.get(code, {})
+        if not by_source:
+            continue
+        row = f"{label_for(code):<14}"
+        for name, _ in SOURCES:
+            val = by_source.get(name)
+            cell = f"{val:,.2f}" if val is not None else "—"
+            row += f"{cell:<{col_width}}"
+        lines.append(row)
+    return lines
+
+
 # --- Quick amount conversion --------------------------------------------------
 
 def conversion_section(rates):
@@ -528,6 +560,10 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
     discrepancy = discrepancy_section(comparable)
     if discrepancy:
         lines += discrepancy + [""]
+
+    all_sources_table = all_sources_table_section(comparable)
+    if all_sources_table:
+        lines += all_sources_table + [""]
 
     used_sources = []
 
@@ -656,6 +692,7 @@ _HTML_COLORS = {
 SECTION_ACCENTS = {
     "best": "#0d9488",         # teal
     "discrepancy": "#d97706",  # amber (paired with the warn background)
+    "compare": "#0e7490",      # cyan — the full side-by-side comparison table
     "market": "#2563eb",       # blue
     "vcb": "#00693e",          # Vietcombank's own brand green
     "fawaz": "#7c3aed",        # purple
@@ -844,6 +881,25 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
             "So sánh giữa các nguồn bên dưới, theo từng loại tiền",
             accent=SECTION_ACCENTS["discrepancy"],
             bg=C["warn_bg"], border=C["warn_border"],
+        ))
+
+    # All sources compared side by side
+    compare_rows = []
+    for code in WATCHLIST:
+        by_source = comparable.get(code, {})
+        if not by_source:
+            continue
+        row = [f"<strong>{_html_label(code)}</strong>"]
+        for name, _ in SOURCES:
+            val = by_source.get(name)
+            row.append(f"{val:,.2f}" if val is not None else f'<span style="color:{C["muted"]};">—</span>')
+        compare_rows.append(tuple(row))
+    if compare_rows:
+        table = _html_source_table(compare_rows, ["Loại tiền"] + SOURCE_SHORT_NAMES, accent=SECTION_ACCENTS["compare"])
+        parts.append(_html_card(
+            "Bảng so sánh tất cả các nguồn", table,
+            "Vietcombank hiển thị giá trị trung bình mua/bán",
+            accent=SECTION_ACCENTS["compare"],
         ))
 
     # Market mid-rate
