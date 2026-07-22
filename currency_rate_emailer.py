@@ -136,7 +136,15 @@ HEADERS = {
 # APIs (not just permission errors), and 5xx are transient server issues.
 RETRYABLE_STATUS_CODES = {403, 429, 500, 502, 503, 504}
 RETRY_ATTEMPTS = 3
-RETRY_BACKOFF_BASE_SECONDS = 2  # waits ~2s, then ~4s between attempts
+RETRY_BACKOFF_BASE_SECONDS = 2  # waits ~2s, then ~4s between attempts — for most retryable errors
+
+# 429 (rate limited) gets its own, much longer backoff: a brief retry rarely helps
+# with a rate limit, since the limit window (e.g. "N requests per minute") is
+# usually still active a couple of seconds later. If the server sends a
+# Retry-After header, that's used instead (capped, so a misbehaving server can't
+# make a run hang indefinitely).
+RATE_LIMIT_BACKOFF_BASE_SECONDS = 20  # waits ~20s, then ~40s if no Retry-After header
+RATE_LIMIT_BACKOFF_MAX_SECONDS = 60
 
 
 def get_with_retry(url, headers=None, params=None, timeout=15):
@@ -151,7 +159,11 @@ def get_with_retry(url, headers=None, params=None, timeout=15):
             resp = requests.get(url, headers=headers, params=params, timeout=timeout)
             if resp.status_code in RETRYABLE_STATUS_CODES and attempt < RETRY_ATTEMPTS - 1:
                 last_error = requests.HTTPError(f"{resp.status_code} (retrying)", response=resp)
-                time.sleep(RETRY_BACKOFF_BASE_SECONDS * (2 ** attempt))
+                if resp.status_code == 429:
+                    wait = _rate_limit_wait_seconds(resp, attempt)
+                else:
+                    wait = RETRY_BACKOFF_BASE_SECONDS * (2 ** attempt)
+                time.sleep(wait)
                 continue
             resp.raise_for_status()
             return resp
@@ -162,6 +174,21 @@ def get_with_retry(url, headers=None, params=None, timeout=15):
                 continue
             raise
     raise last_error
+
+
+def _rate_limit_wait_seconds(resp, attempt):
+    """How long to wait after a 429. Prefers the server's own Retry-After header
+    (seconds format) when present, otherwise falls back to a longer exponential
+    backoff than other error types get, since rate-limit windows rarely clear in
+    just a couple of seconds. Always capped at RATE_LIMIT_BACKOFF_MAX_SECONDS.
+    """
+    retry_after = resp.headers.get("Retry-After")
+    if retry_after:
+        try:
+            return min(float(retry_after), RATE_LIMIT_BACKOFF_MAX_SECONDS)
+        except ValueError:
+            pass  # Retry-After can also be an HTTP-date string — not handled, fall through
+    return min(RATE_LIMIT_BACKOFF_BASE_SECONDS * (2 ** attempt), RATE_LIMIT_BACKOFF_MAX_SECONDS)
 
 SOURCES = [
     ("Tỷ giá trung bình thị trường", "https://www.exchangerate-api.com/"),
