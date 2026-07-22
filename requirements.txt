@@ -1,6 +1,1 @@
 requests>=2.31.0
-
-# Only needed for the experimental VietinBank source (headless-browser scraping,
-# since VietinBank has no public API like Vietcombank does). If this isn't
-# installed, that one source just fails gracefully — everything else still works.
-playwright>=1.40.0
