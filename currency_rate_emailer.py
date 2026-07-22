@@ -1,26 +1,40 @@
 """
 currency_rate_emailer.py
 
-Fetches exchange rates for a watchlist of currencies -> VND, from five
-independent sources, and emails a summary. Designed to run on GitHub Actions
+Fetches exchange rates for a watchlist of currencies -> VND, from six
+sources, and emails a summary. Designed to run on GitHub Actions
 (see .github/workflows/send-currency-rate.yml) or locally via cron. No local
 computer needs to stay on.
 
 Data sources (each rendered as its own section, each degrades gracefully if
 it fails on a given run):
   1. Market mid-rate: https://www.exchangerate-api.com/ (open.er-api.com, free, no key)
-  2. Vietcombank official buy/sell rates: https://www.vietcombank.com.vn/ (public JSON endpoint;
-     may be blocked from cloud/datacenter IPs like GitHub Actions runners)
+  2. Vietcombank reference buy/sell rates: their own public XML feed (documented on
+     their site as "if you need rates in XML format" — a genuine, intentional feed,
+     not a workaround). Rate-limited to 1 request/5min by VCB's own request.
   3. fawazahmed0/currency-api: free, no key, independent aggregator (jsDelivr CDN + pages.dev mirror)
   4. fxratesapi.com: free, no key needed for the latest-rates endpoint
+  5. CoinGecko, via Tether (USDT) as a USD-pegged proxy — a derived cross-rate,
+     not a direct FX source; see the card's description in the email for the caveat.
+  6. VietinBank (EXPERIMENTAL) — scraped with a headless browser (Playwright), since
+     VietinBank doesn't publish a plain public API like Vietcombank does and their
+     page only populates real numbers via JavaScript. This was written without the
+     ability to verify against the live page (see fetch_vietinbank_rates() for why),
+     so it's a best-effort text-pattern parse that may need adjustment — check the
+     Action logs if this source keeps showing "unavailable this run".
 
   (exchangerate.fun was tried and removed — confirmed hard-blocked from GitHub
-  Actions even with retries, likely IP-level, and no free/no-key replacement
-  covering VND was found after two rounds of searching.)
+  Actions even with retries, likely IP-level. BIDV and Techcombank were checked
+  and ruled out — both require a signup-gated developer API for real data. Two
+  third-party VN rate aggregator sites (webgia.com, tygia.com.vn) were checked
+  and ruled out — both serve fake/garbled numbers for most currencies to non-
+  browser requests. Đông Á Bank has a real JSON endpoint but robots.txt disallows
+  automated access to it.)
 
 Extra features:
   - Best-rate highlight: which source gives you the most/least VND per currency
   - Cross-source discrepancy alert: flags currencies where sources disagree a lot
+  - All-sources comparison table: every source's rate for every currency, side by side
   - Quick amount conversion: converts configured VND amounts into your watchlist
   - Historical tracking + weekly trend: logs every run to rate_history.csv and
     emails a 7-day % change summary once a week
@@ -43,6 +57,7 @@ Optional environment variables:
 """
 
 import os
+import re
 import sys
 import csv
 import json
@@ -154,10 +169,11 @@ def get_with_retry(url, headers=None, params=None, timeout=15):
 
 SOURCES = [
     ("Tỷ giá trung bình thị trường", "https://www.exchangerate-api.com/"),
-    ("Tỷ giá chính thức Vietcombank", "https://www.vietcombank.com.vn/en-us/personal/support/exchange-rates"),
+    ("Tỷ giá tham khảo Vietcombank", "https://www.vietcombank.com.vn/en-us/personal/support/exchange-rates"),
     ("fawazahmed0/currency-api", "https://github.com/fawazahmed0/currency-api"),
     ("fxratesapi.com", "https://fxratesapi.com/"),
     ("CoinGecko (qua USDT)", "https://www.coingecko.com/en/api"),
+    ("Tỷ giá tham khảo VietinBank (thử nghiệm)", "https://www.vietinbank.vn/ca-nhan/ty-gia-khcn"),
 ]
 
 # One-line plain-English description of each source, shown under its header in the
@@ -174,6 +190,9 @@ SOURCE_DESCRIPTIONS = [
     "cập nhật thường xuyên trong ngày.",
     "Tỷ giá chéo được suy ra từ Tether (USDT), một stablecoin neo giá theo đô la Mỹ, bằng cách "
     "so sánh giá thị trường của nó tính theo VND với giá thị trường tính theo từng loại tiền.",
+    "Ngân hàng thương mại nhà nước lớn thứ hai Việt Nam. THỬ NGHIỆM: lấy dữ liệu bằng trình duyệt "
+    "tự động vì trang chính thức không có API công khai — có thể không ổn định, sẽ hiển thị lỗi "
+    "nếu cấu trúc trang thay đổi.",
 ]
 
 EMAIL_BODY_FILE = "email_body.txt"
@@ -326,6 +345,102 @@ def fetch_coingecko_rates():
     return rates
 
 
+VIETINBANK_URL = "https://www.vietinbank.vn/ca-nhan/ty-gia-khcn"
+
+# Regex: a currency code (3 capital letters) followed, somewhere in the next
+# ~200 characters of page text, by 2-3 numbers shaped like VND amounts
+# (thousand-separated, with an optional decimal part) — used to pull rates out
+# of the rendered page text without relying on exact CSS class names, since
+# those weren't available to verify ahead of time (see fetch_vietinbank_rates
+# docstring for why).
+_VND_NUMBER = r"[\d]{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?"
+
+
+def _vietinbank_row_pattern(code):
+    escaped = re.escape(code)
+    return (
+        rf"\b{escaped}\b[^0-9A-Za-z]{{1,40}}({_VND_NUMBER})"
+        rf"[^0-9A-Za-z]{{1,20}}({_VND_NUMBER})[^0-9A-Za-z]{{1,20}}({_VND_NUMBER})"
+    )
+
+
+def _parse_vnd_number(s):
+    """Converts a Vietnamese-formatted number string ('26.090,00' or '26,090.00'
+    or '26090') to a float. Vietnamese sites usually use '.' as thousands
+    separator and ',' as decimal — but this handles either convention.
+    """
+    s = s.strip()
+    if "," in s and "." in s:
+        # whichever separator appears last is the decimal separator
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        # ambiguous: could be thousands ("26,090") or decimal ("17,66").
+        # Treat as decimal only if there are exactly 1-2 digits after the comma
+        # and no other comma — otherwise thousands.
+        parts = s.split(",")
+        if len(parts) == 2 and len(parts[1]) <= 2:
+            s = s.replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    return float(s)
+
+
+def fetch_vietinbank_rates():
+    """EXPERIMENTAL. Returns {currency_code: {"buy": VND, "sell": VND}} scraped from
+    VietinBank's own official rates page using a headless browser (Playwright),
+    since — unlike Vietcombank — VietinBank doesn't publish a plain public API and
+    their page only populates real numbers via JavaScript after load.
+
+    IMPORTANT CAVEAT: this was written without the ability to inspect the page's
+    actual rendered HTML/DOM (the sandbox used to build this script couldn't reach
+    vietinbank.vn to verify), so the extraction below is a best-effort, text-pattern
+    based parse rather than a verified CSS-selector scrape. It may need adjustment
+    once run for real — check the GitHub Actions log for this step if this source
+    keeps showing "unavailable this run".
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise RuntimeError("playwright not installed (pip install playwright && playwright install chromium)")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        try:
+            page = browser.new_page(user_agent=HEADERS["User-Agent"])
+            page.goto(VIETINBANK_URL, timeout=30000)
+            # Let the Angular/JS app finish fetching and rendering real rate data.
+            page.wait_for_load_state("networkidle", timeout=20000)
+            text = page.inner_text("body")
+        finally:
+            browser.close()
+
+    rates = {}
+    for code in WATCHLIST:
+        pattern = _vietinbank_row_pattern(code)
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        try:
+            values = [_parse_vnd_number(g) for g in match.groups()]
+        except ValueError:
+            continue
+        # Expect [buy_cash, buy_transfer, sell] in that order, matching the
+        # column layout every other VN bank rate table on this project uses.
+        # Sanity check: VND rates are always > 1 (even JPY/KRW, the smallest
+        # in a typical watchlist) — reject obviously-wrong matches (e.g. the
+        # site showing a stray "0" or a tiny decoy number) rather than passing
+        # bad data through silently.
+        if all(v > 1 for v in values):
+            rates[code] = {"buy": values[0], "sell": values[-1]}
+
+    if not rates:
+        raise RuntimeError("no currencies matched on the rendered page — selectors likely need updating")
+    return rates
+
+
 # --- State (for % change + threshold) --------------------------------------
 
 def load_previous_rates():
@@ -429,9 +544,10 @@ def weekly_trend_rows():
 
 # --- Best-rate + discrepancy analysis ----------------------------------------
 
-def collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates):
+def collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, vietinbank_rates):
     """Builds {currency: {source_name: vnd_per_unit}} across all successful sources.
-    VCB contributes the average of its buy/sell as a single comparable figure.
+    VCB and VietinBank contribute the average of their buy/sell as a single
+    comparable figure.
     """
     comparable = {code: {} for code in WATCHLIST}
 
@@ -450,6 +566,10 @@ def collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates, coing
 
     for code, rate in coingecko_rates.items():
         comparable[code][SOURCES[4][0]] = rate
+
+    for code, vals in vietinbank_rates.items():
+        avg = (vals["buy"] + vals["sell"]) / 2
+        comparable[code][SOURCES[5][0]] = avg
 
     return comparable
 
@@ -494,7 +614,7 @@ def discrepancy_section(comparable):
 
 # Short labels for SOURCES, used only in the side-by-side comparison table where
 # full names would make columns too wide. Indexed the same way as SOURCES.
-SOURCE_SHORT_NAMES = ["TB thị trường", "Vietcombank", "fawazahmed0", "fxratesapi", "CoinGecko"]
+SOURCE_SHORT_NAMES = ["TB thị trường", "Vietcombank", "fawazahmed0", "fxratesapi", "CoinGecko", "VietinBank*"]
 
 
 def all_sources_table_section(comparable):
@@ -556,12 +676,12 @@ def conversion_section(rates):
 
 # --- Formatting -------------------------------------------------------------
 
-def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
+def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, vietinbank_rates, previous_rates,
                        vcb_error=None, fawaz_error=None, fxrates_error=None, coingecko_error=None,
-                       market_error=None):
+                       market_error=None, vietinbank_error=None):
     lines = [f"Tỷ giá quy đổi sang VND - {now_vn().strftime('%Y-%m-%d %H:%M')}\n"]
 
-    comparable = collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates)
+    comparable = collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, vietinbank_rates)
 
     best = best_rate_section(comparable)
     if best:
@@ -598,7 +718,7 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
 
     if vcb_rates:
         lines.append("")
-        lines.append("Tỷ giá chính thức Vietcombank")
+        lines.append("Tỷ giá tham khảo Vietcombank")
         lines.append(f"(nguồn: {SOURCES[1][0]})")
         lines.append(f"{SOURCE_DESCRIPTIONS[1]}")
         lines.append(f"{'Loại tiền':<14}{'Mua (VND)':<16}{'Bán (VND)'}")
@@ -611,7 +731,7 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         used_sources.append(SOURCES[1])
     elif vcb_error:
         lines.append("")
-        lines.append(f"Tỷ giá chính thức Vietcombank: không khả dụng lần này ({vcb_error})")
+        lines.append(f"Tỷ giá tham khảo Vietcombank: không khả dụng lần này ({vcb_error})")
         lines.append(f"(nguồn: {SOURCES[1][0]})")
 
     if fawaz_rates:
@@ -663,6 +783,24 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         lines.append(f"CoinGecko (qua USDT): không khả dụng lần này ({coingecko_error})")
         lines.append(f"(nguồn: {SOURCES[4][0]})")
 
+    if vietinbank_rates:
+        lines.append("")
+        lines.append("Tỷ giá tham khảo VietinBank (THỬ NGHIỆM)")
+        lines.append(f"(nguồn: {SOURCES[5][0]})")
+        lines.append(f"{SOURCE_DESCRIPTIONS[5]}")
+        lines.append(f"{'Loại tiền':<14}{'Mua (VND)':<16}{'Bán (VND)'}")
+        lines.append("-" * 38)
+        for code in WATCHLIST:
+            if code in vietinbank_rates:
+                buy = vietinbank_rates[code]["buy"]
+                sell = vietinbank_rates[code]["sell"]
+                lines.append(f"{label_for(code):<14}{buy:,.2f}{'':<4}{sell:,.2f}")
+        used_sources.append(SOURCES[5])
+    elif vietinbank_error:
+        lines.append("")
+        lines.append(f"Tỷ giá tham khảo VietinBank (THỬ NGHIỆM): không khả dụng lần này ({vietinbank_error})")
+        lines.append(f"(nguồn: {SOURCES[5][0]})")
+
     conversions = conversion_section(rates)
     if conversions:
         lines.append("")
@@ -704,10 +842,11 @@ SECTION_ACCENTS = {
     "discrepancy": "#d97706",  # amber (paired with the warn background)
     "compare": "#0e7490",      # cyan — the full side-by-side comparison table
     "market": "#2563eb",       # blue
-    "vcb": "#00693e",          # Vietcombank's own brand green
+    "vcb": "#475569",          # neutral slate — no longer matches VCB's own brand green
     "fawaz": "#7c3aed",        # purple
     "fxrates": "#ea580c",      # orange
     "coingecko": "#f59e0b",    # gold/amber (crypto-ish, distinct from discrepancy's amber)
+    "vietinbank": "#be123c",   # deep rose — visually flags this card as the experimental one
     "conversions": "#4f46e5",  # indigo
     "trend": "#db2777",        # rose
 }
@@ -829,11 +968,11 @@ def _html_source_label(name, url):
     return f"Nguồn: {_html_escape(name)}"
 
 
-def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
+def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, vietinbank_rates, previous_rates,
                        vcb_error=None, fawaz_error=None, fxrates_error=None, coingecko_error=None,
-                       market_error=None):
+                       market_error=None, vietinbank_error=None):
     C = _HTML_COLORS
-    comparable = collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates)
+    comparable = collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, vietinbank_rates)
     used_sources = []
 
     parts = []
@@ -945,7 +1084,7 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
             for code in WATCHLIST if code in vcb_rates
         ]
         parts.append(_html_card(
-            "Tỷ giá chính thức Vietcombank",
+            "Tỷ giá tham khảo Vietcombank",
             _html_source_table(vcb_rows, ["Loại tiền", "Mua (VND)", "Bán (VND)"], accent=SECTION_ACCENTS["vcb"]),
             _html_source_label(*SOURCES[1]),
             accent=SECTION_ACCENTS["vcb"],
@@ -954,7 +1093,7 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         used_sources.append(SOURCES[1])
     elif vcb_error:
         parts.append(_html_card(
-            "Tỷ giá chính thức Vietcombank",
+            "Tỷ giá tham khảo Vietcombank",
             f'<div style="color:{C["muted"]};font-size:13px;">Không khả dụng lần này: {_html_escape(vcb_error)}</div>',
             _html_source_label(*SOURCES[1]),
             accent=SECTION_ACCENTS["vcb"],
@@ -1005,6 +1144,32 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
             f'<div style="color:{C["muted"]};font-size:13px;">Không khả dụng lần này: {_html_escape(coingecko_error)}</div>',
             _html_source_label(*SOURCES[4]),
             accent=coingecko_accent,
+        ))
+
+    # VietinBank — experimental, scraped via headless browser. Kept separate
+    # since it needs its own "unverified" caveat, distinct from the standard
+    # source description pattern.
+    vietinbank_accent = SECTION_ACCENTS["vietinbank"]
+    if vietinbank_rates:
+        vtb_rows = [
+            (f"<strong>{_html_label(code)}</strong>", f"{vietinbank_rates[code]['buy']:,.2f}", f"{vietinbank_rates[code]['sell']:,.2f}")
+            for code in WATCHLIST if code in vietinbank_rates
+        ]
+        parts.append(_html_card(
+            "&#9888;&#65039; Tỷ giá tham khảo VietinBank (THỬ NGHIỆM)",
+            _html_source_table(vtb_rows, ["Loại tiền", "Mua (VND)", "Bán (VND)"], accent=vietinbank_accent),
+            _html_source_label(*SOURCES[5]),
+            accent=vietinbank_accent,
+            description=SOURCE_DESCRIPTIONS[5],
+        ))
+        used_sources.append(SOURCES[5])
+    elif vietinbank_error:
+        parts.append(_html_card(
+            "&#9888;&#65039; Tỷ giá tham khảo VietinBank (THỬ NGHIỆM)",
+            f'<div style="color:{C["muted"]};font-size:13px;">Không khả dụng lần này: {_html_escape(vietinbank_error)}</div>',
+            _html_source_label(*SOURCES[5]),
+            accent=vietinbank_accent,
+            description=SOURCE_DESCRIPTIONS[5],
         ))
 
     # Quick conversions
@@ -1080,7 +1245,7 @@ def build_alert_body_text(errors):
     lines = [
         f"CẢNH BÁO: Không lấy được tỷ giá từ bất kỳ nguồn nào - {now_vn().strftime('%Y-%m-%d %H:%M')}",
         "",
-        "Cả 5 nguồn dữ liệu đều gặp lỗi trong lần chạy này, nên không có tỷ giá nào để gửi.",
+        f"Cả {len(errors)} nguồn dữ liệu đều gặp lỗi trong lần chạy này, nên không có tỷ giá nào để gửi.",
         "",
         "Chi tiết lỗi từng nguồn:",
     ]
@@ -1109,7 +1274,7 @@ def build_alert_body_html(errors):
         f'<div style="font-size:13px;color:#fee2e2;">{now_vn().strftime("%Y-%m-%d %H:%M")} (giờ Việt Nam)</div>'
         f'</div>'
         f'<div style="border:1px solid {C["border"]};border-radius:8px;padding:16px 18px;">'
-        f'<div style="font-size:14px;margin-bottom:12px;">Cả 5 nguồn dữ liệu đều gặp lỗi trong lần chạy này, '
+        f'<div style="font-size:14px;margin-bottom:12px;">Cả {len(errors)} nguồn dữ liệu đều gặp lỗi trong lần chạy này, '
         f'nên không có tỷ giá nào để gửi.</div>'
         f'{rows}'
         f'<div style="font-size:12.5px;color:{C["muted"]};margin-top:14px;">Hãy kiểm tra lại kết nối mạng của '
@@ -1173,19 +1338,28 @@ def cmd_generate():
         coingecko_rates = {}
         coingecko_error = str(e)
 
-    all_rate_dicts = [rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates]
+    try:
+        vietinbank_rates = fetch_vietinbank_rates()
+        vietinbank_error = None
+    except Exception as e:
+        print(f"VietinBank source (experimental) failed ({e}), continuing without it.")
+        vietinbank_rates = {}
+        vietinbank_error = str(e)
+
+    all_rate_dicts = [rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, vietinbank_rates]
     success_count = sum(1 for r in all_rate_dicts if r)
 
     if success_count == 0:
         # Total failure: every source failed. Send a short, distinct alert
         # instead of a near-empty digest, so it doesn't get missed.
-        print("ALERT: all 5 sources failed this run.")
+        print("ALERT: all 6 sources failed this run.")
         errors = [
             (SOURCES[0][0], market_error),
             (SOURCES[1][0], vcb_error),
             (SOURCES[2][0], fawaz_error),
             (SOURCES[3][0], fxrates_error),
             (SOURCES[4][0], coingecko_error),
+            (SOURCES[5][0], vietinbank_error),
         ]
         body = build_alert_body_text(errors)
         html_body = build_alert_body_html(errors)
@@ -1200,10 +1374,10 @@ def cmd_generate():
         # No new data was fetched — don't overwrite the rate cache or history.
         return
 
-    body = format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
-                              vcb_error, fawaz_error, fxrates_error, coingecko_error, market_error)
-    html_body = format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
-                                   vcb_error, fawaz_error, fxrates_error, coingecko_error, market_error)
+    body = format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, vietinbank_rates, previous_rates,
+                              vcb_error, fawaz_error, fxrates_error, coingecko_error, market_error, vietinbank_error)
+    html_body = format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, vietinbank_rates, previous_rates,
+                                   vcb_error, fawaz_error, fxrates_error, coingecko_error, market_error, vietinbank_error)
     with open(EMAIL_BODY_FILE, "w") as f:
         f.write(body)
     with open(EMAIL_HTML_FILE, "w") as f:
