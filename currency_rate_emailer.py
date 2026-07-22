@@ -437,7 +437,19 @@ def fetch_vietinbank_rates():
             rates[code] = {"buy": values[0], "sell": values[-1]}
 
     if not rates:
-        raise RuntimeError("no currencies matched on the rendered page — selectors likely need updating")
+        # Log what the page actually rendered so this can be diagnosed from the
+        # GitHub Actions log — find where "USD" first appears in the text (a
+        # near-guaranteed anchor point) and show the surrounding context, since
+        # that's almost certainly where the real rate table sits.
+        usd_idx = text.find("USD")
+        if usd_idx >= 0:
+            snippet = text[max(0, usd_idx - 100):usd_idx + 600]
+        else:
+            snippet = text[:700]
+        print("---- VietinBank page text snippet (for debugging the extraction pattern) ----")
+        print(snippet)
+        print("---- end snippet ----")
+        raise RuntimeError("no currencies matched on the rendered page — selectors likely need updating (see snippet above in the log)")
     return rates
 
 
