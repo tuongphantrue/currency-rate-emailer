@@ -21,23 +21,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Cache Playwright browser (for VietinBank source)
-        uses: actions/cache@v4
-        id: playwright-cache
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-
-      - name: Install Playwright's Chromium browser binary (for VietinBank source)
-        if: steps.playwright-cache.outputs.cache-hit != 'true'
-        run: playwright install chromium
-
-      - name: Install Playwright's system dependencies (for VietinBank source)
-        # These are OS-level packages (via apt), not part of the cached browser
-        # binary above, so they're needed every run since GitHub-hosted runners
-        # are ephemeral and don't retain apt-installed packages between runs.
-        run: playwright install-deps chromium
-
       - name: Generate email
         env:
           ALERT_THRESHOLD_PERCENT: ""   # set e.g. "1.5" to only email on big moves
