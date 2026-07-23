@@ -860,7 +860,16 @@ def _html_card(title_html, inner_html, source_html, accent=None, accent_key=None
     accent, if given, colors the left border, title, and a small dot marker.
     accent_key, if given, adds a class so dark mode can brighten the title
     text color independently (see SECTION_ACCENTS_DARK) without touching the
-    left border, which stays the same accent color in both modes."""
+    left border, which stays the same accent color in both modes.
+
+    Each card is collapsible via a CSS-only checkbox toggle (no JavaScript,
+    since email clients strip it) — click the title to collapse/expand.
+    IMPORTANT: this defaults to EXPANDED, and checking the box COLLAPSES it
+    (not the more common reverse pattern). Email clients that don't support
+    this CSS technique (e.g. the Gmail mobile app) just show an inert,
+    hidden checkbox and the card stays expanded — nobody loses content on
+    an unsupported client, which is the failure mode that matters most here.
+    """
     is_warn = bg is not None  # only the discrepancy-alert card passes a custom bg today
     bg = bg or "#ffffff"
     border = border or _HTML_COLORS["border"]
@@ -878,14 +887,22 @@ def _html_card(title_html, inner_html, source_html, accent=None, accent_key=None
         f'{_html_escape(description)}</div>'
         if description else ""
     )
+    toggle_id = _next_card_id()
     return (
         f'<div class="{card_class}" style="border:1px solid {border};border-left:{left_border};border-radius:8px;'
         f'padding:16px 18px;margin-bottom:16px;background:{bg};">'
-        f'<div class="{title_class}" style="font-size:15px;font-weight:700;color:{title_color};margin-bottom:2px;">{dot}{title_html}</div>'
+        f'<input type="checkbox" id="{toggle_id}" class="crx-toggle-checkbox" style="display:none !important;">'
+        f'<label for="{toggle_id}" class="crx-card-label" style="display:block;cursor:pointer;margin-bottom:2px;">'
+        f'<span class="crx-chevron-open" style="font-size:11px;color:{_HTML_COLORS["muted"]};display:inline-block;width:14px;">&#9662;</span>'
+        f'<span class="crx-chevron-closed" style="display:none;font-size:11px;color:{_HTML_COLORS["muted"]};width:14px;">&#9656;</span>'
+        f'<span class="{title_class}" style="font-size:15px;font-weight:700;color:{title_color};">{dot}{title_html}</span>'
+        f'</label>'
+        f'<div class="crx-collapsible">'
         f'<div class="crx-muted" style="font-size:11px;color:{_HTML_COLORS["muted"]};margin-bottom:4px;'
         f'text-transform:uppercase;letter-spacing:.03em;">{source_html}</div>'
         f"{desc_html}"
-        f"{inner_html}</div>"
+        f"{inner_html}"
+        f"</div></div>"
     )
 
 
@@ -894,6 +911,21 @@ def _html_source_label(name, url):
     actual clickable URL appears once, in the consolidated footer at the very
     end of the email, instead of being repeated as a link on every card."""
     return f"Nguồn: {_html_escape(name)}"
+
+
+# Unique IDs for the collapsible-card checkboxes below, reset at the start of
+# each top-level email-building function so IDs never collide within one
+# render and don't grow unbounded across multiple emails in the same process.
+_card_id_counter = [0]
+
+
+def _next_card_id():
+    _card_id_counter[0] += 1
+    return f"crx-toggle-{_card_id_counter[0]}"
+
+
+def _reset_card_id_counter():
+    _card_id_counter[0] = 0
 
 
 # Dark-mode support for Gmail/Outlook/Apple Mail. Inline styles normally win
@@ -932,17 +964,29 @@ _DARK_MODE_STYLE_BLOCK = """
 """
 
 
+# CSS-only collapsible sections (checkbox hack — no JavaScript, since email
+# clients strip it). Defaults to EXPANDED; checking the box COLLAPSES the
+# card, which is the safer default for clients that don't support this
+# technique at all (they just see an inert checkbox, content stays visible).
+_COLLAPSIBLE_STYLE_BLOCK = """
+    .crx-toggle-checkbox:checked ~ .crx-collapsible { display: none !important; }
+    .crx-toggle-checkbox:checked ~ .crx-card-label .crx-chevron-open { display: none !important; }
+    .crx-toggle-checkbox:checked ~ .crx-card-label .crx-chevron-closed { display: inline-block !important; }
+"""
+
+
 def _html_document(body_html):
     """Wraps a body fragment in a full HTML document with the meta tags and
     <style> block email clients need to apply real dark-mode support instead
-    of their own automatic (often ugly) light-to-dark inversion heuristics.
+    of their own automatic (often ugly) light-to-dark inversion heuristics,
+    plus the CSS for the collapsible-section checkbox toggles.
     """
     return (
         "<!DOCTYPE html>"
         '<html><head><meta charset="utf-8">'
         '<meta name="color-scheme" content="light dark">'
         '<meta name="supported-color-schemes" content="light dark">'
-        f"<style>{_DARK_MODE_STYLE_BLOCK}</style>"
+        f"<style>{_COLLAPSIBLE_STYLE_BLOCK}{_DARK_MODE_STYLE_BLOCK}</style>"
         f"</head><body style=\"margin:0;padding:0;\">{body_html}</body></html>"
     )
 
@@ -950,6 +994,7 @@ def _html_document(body_html):
 def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
                        vcb_error=None, fawaz_error=None, fxrates_error=None, coingecko_error=None,
                        market_error=None):
+    _reset_card_id_counter()
     C = _HTML_COLORS
     comparable = collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates)
     used_sources = []
