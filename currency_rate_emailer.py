@@ -751,6 +751,25 @@ SECTION_ACCENTS = {
     "trend": "#db2777",        # rose
 }
 
+# Brightened versions of each accent, used ONLY for title/header text color in dark
+# mode. The accents above were tuned to read well as text on a WHITE background;
+# several (vcb, fawaz, conversions, compare, market, best, trend) fall below WCAG AA
+# (4.5:1) as text on a dark card background, verified by computing actual contrast
+# ratios — not just eyeballed. These are the minimum white-blend needed per accent to
+# clear 4.5:1 against the #1e1e1e dark card background used below.
+SECTION_ACCENTS_DARK = {
+    "best": "#19998e",
+    "discrepancy": "#d97706",   # already passes as-is, unchanged
+    "compare": "#3e90a6",
+    "market": "#5182ef",
+    "vcb": "#7e8896",
+    "fawaz": "#9d6bf2",
+    "fxrates": "#ea580c",       # already passes as-is, unchanged
+    "coingecko": "#f59e0b",     # already passes as-is, unchanged
+    "conversions": "#847eed",
+    "trend": "#e25292",
+}
+
 # Small color dot shown next to each currency code, roughly evoking each currency's
 # home flag/brand without reproducing any actual flag imagery.
 CURRENCY_DOT_COLORS = {
@@ -806,13 +825,16 @@ def _html_change_span(pct):
     )
 
 
-def _html_source_table(rows, headers, accent=None):
+def _html_source_table(rows, headers, accent=None, accent_key=None):
     """rows: list of tuples matching headers. Renders a simple bordered table.
-    accent, if given, tints the header row background and text with that color."""
+    accent, if given, tints the header row background and text with that color.
+    accent_key, if given, adds a class so dark mode can brighten the header text
+    color independently (see SECTION_ACCENTS_DARK)."""
     header_bg = _tint(accent, 0.90) if accent else "transparent"
     header_color = accent if accent else _HTML_COLORS["muted"]
+    header_class = f"crx-accent-{accent_key}" if accent_key else ""
     th = "".join(
-        f'<th style="text-align:left;padding:6px 10px;border-bottom:2px solid {_HTML_COLORS["border"]};'
+        f'<th class="crx-thead {header_class}" style="text-align:left;padding:6px 10px;border-bottom:2px solid {_HTML_COLORS["border"]};'
         f'background:{header_bg};font-size:12px;color:{header_color};font-weight:700;'
         f'text-transform:uppercase;letter-spacing:.03em;">{h}</th>'
         for h in headers
@@ -820,7 +842,7 @@ def _html_source_table(rows, headers, accent=None):
     body_rows = ""
     for row in rows:
         cells = "".join(
-            f'<td style="padding:6px 10px;border-bottom:1px solid {_HTML_COLORS["border"]};font-size:14px;">{cell}</td>'
+            f'<td class="crx-td" style="padding:6px 10px;border-bottom:1px solid {_HTML_COLORS["border"]};font-size:14px;">{cell}</td>'
             for cell in row
         )
         body_rows += f"<tr>{cells}</tr>"
@@ -830,14 +852,20 @@ def _html_source_table(rows, headers, accent=None):
     )
 
 
-def _html_card(title_html, inner_html, source_html, accent=None, bg=None, border=None, description=None):
+def _html_card(title_html, inner_html, source_html, accent=None, accent_key=None, bg=None, border=None, description=None):
     """source_html is required and always rendered — either a link to the
     original source, or a short note for derived/multi-source sections.
     description, if given, is a normal-case sentence shown below the source
     line explaining what the source actually is.
-    accent, if given, colors the left border, title, and a small dot marker."""
+    accent, if given, colors the left border, title, and a small dot marker.
+    accent_key, if given, adds a class so dark mode can brighten the title
+    text color independently (see SECTION_ACCENTS_DARK) without touching the
+    left border, which stays the same accent color in both modes."""
+    is_warn = bg is not None  # only the discrepancy-alert card passes a custom bg today
     bg = bg or "#ffffff"
     border = border or _HTML_COLORS["border"]
+    card_class = "crx-card-warn" if is_warn else "crx-card"
+    title_class = f"crx-accent-{accent_key}" if accent_key else ""
     left_border = f"4px solid {accent}" if accent else f"1px solid {border}"
     title_color = accent if accent else _HTML_COLORS["text"]
     dot = (
@@ -846,15 +874,15 @@ def _html_card(title_html, inner_html, source_html, accent=None, bg=None, border
         if accent else ""
     )
     desc_html = (
-        f'<div style="font-size:12.5px;color:{_HTML_COLORS["muted"]};margin-bottom:10px;line-height:1.4;">'
+        f'<div class="crx-muted" style="font-size:12.5px;color:{_HTML_COLORS["muted"]};margin-bottom:10px;line-height:1.4;">'
         f'{_html_escape(description)}</div>'
         if description else ""
     )
     return (
-        f'<div style="border:1px solid {border};border-left:{left_border};border-radius:8px;'
+        f'<div class="{card_class}" style="border:1px solid {border};border-left:{left_border};border-radius:8px;'
         f'padding:16px 18px;margin-bottom:16px;background:{bg};">'
-        f'<div style="font-size:15px;font-weight:700;color:{title_color};margin-bottom:2px;">{dot}{title_html}</div>'
-        f'<div style="font-size:11px;color:{_HTML_COLORS["muted"]};margin-bottom:4px;'
+        f'<div class="{title_class}" style="font-size:15px;font-weight:700;color:{title_color};margin-bottom:2px;">{dot}{title_html}</div>'
+        f'<div class="crx-muted" style="font-size:11px;color:{_HTML_COLORS["muted"]};margin-bottom:4px;'
         f'text-transform:uppercase;letter-spacing:.03em;">{source_html}</div>'
         f"{desc_html}"
         f"{inner_html}</div>"
@@ -866,6 +894,57 @@ def _html_source_label(name, url):
     actual clickable URL appears once, in the consolidated footer at the very
     end of the email, instead of being repeated as a link on every card."""
     return f"Nguồn: {_html_escape(name)}"
+
+
+# Dark-mode support for Gmail/Outlook/Apple Mail. Inline styles normally win
+# over stylesheets, so this uses `!important` in a <head><style> block to
+# override them specifically inside a `prefers-color-scheme: dark` query —
+# the standard technique for HTML email dark mode. Only border-top/-right/
+# -bottom are touched (never border-left), so each card's colored left accent
+# stripe stays the same vivid color in both light and dark mode.
+_DARK_MODE_STYLE_BLOCK = """
+    @media (prefers-color-scheme: dark) {
+      .crx-card {
+        background: #1e1e1e !important;
+        border-top-color: #3a3a3a !important;
+        border-right-color: #3a3a3a !important;
+        border-bottom-color: #3a3a3a !important;
+        color: #e8e8e8 !important;
+      }
+      .crx-card-warn {
+        background: #332b12 !important;
+        border-top-color: #6b5615 !important;
+        border-right-color: #6b5615 !important;
+        border-bottom-color: #6b5615 !important;
+        color: #e8e8e8 !important;
+      }
+      .crx-muted { color: #9aa1a9 !important; }
+      .crx-footer { border-top-color: #3a3a3a !important; }
+      .crx-thead {
+        background: rgba(255,255,255,0.06) !important;
+        border-bottom-color: #3a3a3a !important;
+      }
+      .crx-td { border-bottom-color: #3a3a3a !important; }
+""" + "".join(
+    f'      .crx-accent-{key} {{ color: {dark_hex} !important; }}\n'
+    for key, dark_hex in SECTION_ACCENTS_DARK.items()
+) + """    }
+"""
+
+
+def _html_document(body_html):
+    """Wraps a body fragment in a full HTML document with the meta tags and
+    <style> block email clients need to apply real dark-mode support instead
+    of their own automatic (often ugly) light-to-dark inversion heuristics.
+    """
+    return (
+        "<!DOCTYPE html>"
+        '<html><head><meta charset="utf-8">'
+        '<meta name="color-scheme" content="light dark">'
+        '<meta name="supported-color-schemes" content="light dark">'
+        f"<style>{_DARK_MODE_STYLE_BLOCK}</style>"
+        f"</head><body style=\"margin:0;padding:0;\">{body_html}</body></html>"
+    )
 
 
 def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
@@ -901,15 +980,15 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
             continue
         best_rows.append((
             f"<strong>{_html_label(code)}</strong>",
-            f'{best_rate:,.2f} <span style="color:{C["muted"]};font-size:12px;">({_html_escape(best_source)})</span>',
-            f'{worst_rate:,.2f} <span style="color:{C["muted"]};font-size:12px;">({_html_escape(worst_source)})</span>',
+            f'{best_rate:,.2f} <span class="crx-muted" style="color:{C["muted"]};font-size:12px;">({_html_escape(best_source)})</span>',
+            f'{worst_rate:,.2f} <span class="crx-muted" style="color:{C["muted"]};font-size:12px;">({_html_escape(worst_source)})</span>',
         ))
     if best_rows:
-        table = _html_source_table(best_rows, ["Loại tiền", "Cao nhất", "Thấp nhất"], accent=SECTION_ACCENTS["best"])
+        table = _html_source_table(best_rows, ["Loại tiền", "Cao nhất", "Thấp nhất"], accent=SECTION_ACCENTS["best"], accent_key="best")
         parts.append(_html_card(
             "Tỷ giá cao nhất / thấp nhất theo nguồn", table,
             "So sánh giữa các nguồn bên dưới, theo từng loại tiền",
-            accent=SECTION_ACCENTS["best"],
+            accent=SECTION_ACCENTS["best"], accent_key="best",
         ))
 
     # Discrepancy alert
@@ -923,12 +1002,12 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         if spread_pct >= DISCREPANCY_THRESHOLD_PERCENT:
             disc_rows.append((f"<strong>{_html_label(code)}</strong>", f"{spread_pct:.2f}%", f"{min_rate:,.2f} - {max_rate:,.2f} VND"))
     if disc_rows:
-        table = _html_source_table(disc_rows, ["Loại tiền", "Chênh lệch", "Khoảng"], accent=SECTION_ACCENTS["discrepancy"])
+        table = _html_source_table(disc_rows, ["Loại tiền", "Chênh lệch", "Khoảng"], accent=SECTION_ACCENTS["discrepancy"], accent_key="discrepancy")
         parts.append(_html_card(
             f"&#9888; Cảnh báo chênh lệch giữa các nguồn (&ge;{DISCREPANCY_THRESHOLD_PERCENT:.1f}%)",
             table,
             "So sánh giữa các nguồn bên dưới, theo từng loại tiền",
-            accent=SECTION_ACCENTS["discrepancy"],
+            accent=SECTION_ACCENTS["discrepancy"], accent_key="discrepancy",
             bg=C["warn_bg"], border=C["warn_border"],
         ))
 
@@ -941,14 +1020,14 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         row = [f"<strong>{_html_label(code)}</strong>"]
         for name, _ in SOURCES:
             val = by_source.get(name)
-            row.append(f"{val:,.2f}" if val is not None else f'<span style="color:{C["muted"]};">—</span>')
+            row.append(f"{val:,.2f}" if val is not None else f'<span class="crx-muted" style="color:{C["muted"]};">—</span>')
         compare_rows.append(tuple(row))
     if compare_rows:
-        table = _html_source_table(compare_rows, ["Loại tiền"] + SOURCE_SHORT_NAMES, accent=SECTION_ACCENTS["compare"])
+        table = _html_source_table(compare_rows, ["Loại tiền"] + SOURCE_SHORT_NAMES, accent=SECTION_ACCENTS["compare"], accent_key="compare")
         parts.append(_html_card(
             "Bảng so sánh tất cả các nguồn", table,
             "Vietcombank hiển thị giá trị trung bình mua/bán",
-            accent=SECTION_ACCENTS["compare"],
+            accent=SECTION_ACCENTS["compare"], accent_key="compare",
         ))
 
     # Market mid-rate
@@ -963,18 +1042,18 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
             market_rows.append((f"<strong>{_html_label(code)}</strong>", f"{rate:,.2f}", change_cell))
         parts.append(_html_card(
             "Tỷ giá trung bình thị trường",
-            _html_source_table(market_rows, ["Loại tiền", "1 đơn vị = VND", "Thay đổi"], accent=SECTION_ACCENTS["market"]),
+            _html_source_table(market_rows, ["Loại tiền", "1 đơn vị = VND", "Thay đổi"], accent=SECTION_ACCENTS["market"], accent_key="market"),
             _html_source_label(*SOURCES[0]),
-            accent=SECTION_ACCENTS["market"],
+            accent=SECTION_ACCENTS["market"], accent_key="market",
             description=SOURCE_DESCRIPTIONS[0],
         ))
         used_sources.append(SOURCES[0])
     elif market_error:
         parts.append(_html_card(
             "Tỷ giá trung bình thị trường",
-            f'<div style="color:{C["muted"]};font-size:13px;">Không khả dụng lần này: {_html_escape(market_error)}</div>',
+            f'<div class="crx-muted" style="color:{C["muted"]};font-size:13px;">Không khả dụng lần này: {_html_escape(market_error)}</div>',
             _html_source_label(*SOURCES[0]),
-            accent=SECTION_ACCENTS["market"],
+            accent=SECTION_ACCENTS["market"], accent_key="market",
         ))
 
     # Vietcombank
@@ -985,18 +1064,18 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         ]
         parts.append(_html_card(
             "Tỷ giá tham khảo Vietcombank",
-            _html_source_table(vcb_rows, ["Loại tiền", "Mua (VND)", "Bán (VND)"], accent=SECTION_ACCENTS["vcb"]),
+            _html_source_table(vcb_rows, ["Loại tiền", "Mua (VND)", "Bán (VND)"], accent=SECTION_ACCENTS["vcb"], accent_key="vcb"),
             _html_source_label(*SOURCES[1]),
-            accent=SECTION_ACCENTS["vcb"],
+            accent=SECTION_ACCENTS["vcb"], accent_key="vcb",
             description=SOURCE_DESCRIPTIONS[1],
         ))
         used_sources.append(SOURCES[1])
     elif vcb_error:
         parts.append(_html_card(
             "Tỷ giá tham khảo Vietcombank",
-            f'<div style="color:{C["muted"]};font-size:13px;">Không khả dụng lần này: {_html_escape(vcb_error)}</div>',
+            f'<div class="crx-muted" style="color:{C["muted"]};font-size:13px;">Không khả dụng lần này: {_html_escape(vcb_error)}</div>',
             _html_source_label(*SOURCES[1]),
-            accent=SECTION_ACCENTS["vcb"],
+            accent=SECTION_ACCENTS["vcb"], accent_key="vcb",
         ))
 
     # Independent aggregators
@@ -1010,18 +1089,20 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
             rows = [(f"<strong>{_html_label(code)}</strong>", f"{source_rates[code]:,.2f}") for code in WATCHLIST if code in source_rates]
             parts.append(_html_card(
                 f"{label} (nguồn tổng hợp độc lập)",
-                _html_source_table(rows, ["Loại tiền", "1 đơn vị = VND"], accent=accent),
+                _html_source_table(rows, ["Loại tiền", "1 đơn vị = VND"], accent=accent, accent_key=accent_key),
                 _html_source_label(*source_entry),
                 accent=accent,
+                accent_key=accent_key,
                 description=desc,
             ))
             used_sources.append(source_entry)
         elif error:
             parts.append(_html_card(
                 f"{label} (nguồn tổng hợp độc lập)",
-                f'<div style="color:{C["muted"]};font-size:13px;">Không khả dụng lần này: {_html_escape(error)}</div>',
+                f'<div class="crx-muted" style="color:{C["muted"]};font-size:13px;">Không khả dụng lần này: {_html_escape(error)}</div>',
                 _html_source_label(*source_entry),
                 accent=accent,
+                accent_key=accent_key,
             ))
 
     # CoinGecko (via USDT) — kept separate from the aggregator loop since it needs
@@ -1031,9 +1112,10 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         rows = [(f"<strong>{_html_label(code)}</strong>", f"{coingecko_rates[code]:,.2f}") for code in WATCHLIST if code in coingecko_rates]
         parts.append(_html_card(
             "CoinGecko (qua USDT)",
-            _html_source_table(rows, ["Loại tiền", "1 đơn vị = VND"], accent=coingecko_accent),
+            _html_source_table(rows, ["Loại tiền", "1 đơn vị = VND"], accent=coingecko_accent, accent_key="coingecko"),
             _html_source_label(*SOURCES[4]),
             accent=coingecko_accent,
+            accent_key="coingecko",
             description=SOURCE_DESCRIPTIONS[4] + " Không phải tỷ giá trực tiếp — có sai số nhỏ "
                         "do biến động giá tiền điện tử (thường dưới 0.5%).",
         ))
@@ -1041,9 +1123,10 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
     elif coingecko_error:
         parts.append(_html_card(
             "CoinGecko (qua USDT)",
-            f'<div style="color:{C["muted"]};font-size:13px;">Không khả dụng lần này: {_html_escape(coingecko_error)}</div>',
+            f'<div class="crx-muted" style="color:{C["muted"]};font-size:13px;">Không khả dụng lần này: {_html_escape(coingecko_error)}</div>',
             _html_source_label(*SOURCES[4]),
             accent=coingecko_accent,
+            accent_key="coingecko",
         ))
 
     # Quick conversions
@@ -1058,11 +1141,11 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
                 converted = amount / rates[code]
                 row.append(f"{symbol_for(code)}{converted:,.2f}")
             conv_rows.append(tuple(row))
-        table = _html_source_table(conv_rows, ["Loại tiền"] + amount_headers, accent=SECTION_ACCENTS["conversions"])
+        table = _html_source_table(conv_rows, ["Loại tiền"] + amount_headers, accent=SECTION_ACCENTS["conversions"], accent_key="conversions")
         parts.append(_html_card(
             "Quy đổi nhanh", table,
             f"Tính theo {_html_escape(SOURCES[0][0])}",
-            accent=SECTION_ACCENTS["conversions"],
+            accent=SECTION_ACCENTS["conversions"], accent_key="conversions",
         ))
 
     # Weekly trend
@@ -1071,9 +1154,9 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         rows = [(f"<strong>{_html_label(r['code'])}</strong>", _html_change_span(r["pct"])) for r in trend_rows]
         parts.append(_html_card(
             "Xu hướng tuần (thay đổi 7 ngày)",
-            _html_source_table(rows, ["Loại tiền", "Thay đổi"], accent=SECTION_ACCENTS["trend"]),
+            _html_source_table(rows, ["Loại tiền", "Thay đổi"], accent=SECTION_ACCENTS["trend"], accent_key="trend"),
             f"Tính theo lịch sử {_html_escape(SOURCES[0][0])}, ghi lại mỗi lần chạy",
-            accent=SECTION_ACCENTS["trend"],
+            accent=SECTION_ACCENTS["trend"], accent_key="trend",
         ))
 
     # Sources footer
@@ -1082,12 +1165,12 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         for name, url in used_sources
     )
     parts.append(
-        f'<div style="font-size:12px;color:{C["muted"]};border-top:1px solid {C["border"]};padding-top:12px;margin-top:8px;">'
+        f'<div class="crx-muted crx-footer" style="font-size:12px;color:{C["muted"]};border-top:1px solid {C["border"]};padding-top:12px;margin-top:8px;">'
         f"Nguồn dữ liệu: {source_links}</div>"
     )
 
     parts.append("</div>")
-    return "".join(parts)
+    return _html_document("".join(parts))
 
 
 # --- Email --------------------------------------------------------------------
@@ -1136,26 +1219,27 @@ def build_alert_body_text(errors):
 def build_alert_body_html(errors):
     C = _HTML_COLORS
     rows = "".join(
-        f'<div style="padding:6px 0;border-bottom:1px solid {C["border"]};font-size:14px;">'
-        f'<strong>{_html_escape(name)}</strong>: <span style="color:{C["muted"]};">{_html_escape(error)}</span></div>'
+        f'<div class="crx-td" style="padding:6px 0;border-bottom:1px solid {C["border"]};font-size:14px;">'
+        f'<strong>{_html_escape(name)}</strong>: <span class="crx-muted" style="color:{C["muted"]};">{_html_escape(error)}</span></div>'
         for name, error in errors
     )
-    return (
+    inner = (
         f'<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;'
         f'max-width:640px;margin:0 auto;color:{C["text"]};">'
         f'<div style="background:{C["down"]};border-radius:10px;padding:20px 22px;margin-bottom:20px;">'
         f'<h1 style="font-size:20px;margin:0 0 4px;color:#ffffff;">&#128680; Cảnh báo: Tất cả nguồn tỷ giá đều lỗi</h1>'
         f'<div style="font-size:13px;color:#fee2e2;">{now_vn().strftime("%Y-%m-%d %H:%M")} (giờ Việt Nam)</div>'
         f'</div>'
-        f'<div style="border:1px solid {C["border"]};border-radius:8px;padding:16px 18px;">'
+        f'<div class="crx-card" style="border:1px solid {C["border"]};border-radius:8px;padding:16px 18px;">'
         f'<div style="font-size:14px;margin-bottom:12px;">Cả {len(errors)} nguồn dữ liệu đều gặp lỗi trong lần chạy này, '
         f'nên không có tỷ giá nào để gửi.</div>'
         f'{rows}'
-        f'<div style="font-size:12.5px;color:{C["muted"]};margin-top:14px;">Hãy kiểm tra lại kết nối mạng của '
+        f'<div class="crx-muted" style="font-size:12.5px;color:{C["muted"]};margin-top:14px;">Hãy kiểm tra lại kết nối mạng của '
         f'GitHub Actions runner, hoặc trạng thái hiện tại của từng API. Nếu chỉ một vài nguồn lỗi (không phải '
         f'tất cả), email tỷ giá bình thường vẫn được gửi như thường lệ.</div>'
         f'</div></div>'
     )
+    return _html_document(inner)
 
 
 # --- Commands -----------------------------------------------------------------
