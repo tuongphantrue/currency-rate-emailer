@@ -866,9 +866,13 @@ def _html_card(title_html, inner_html, source_html, accent=None, accent_key=None
     since email clients strip it) — click the title to collapse/expand.
     IMPORTANT: this defaults to EXPANDED, and checking the box COLLAPSES it
     (not the more common reverse pattern). Email clients that don't support
-    this CSS technique (e.g. the Gmail mobile app) just show an inert,
-    hidden checkbox and the card stays expanded — nobody loses content on
-    an unsupported client, which is the failure mode that matters most here.
+    this CSS technique at all just show an inert, hidden checkbox and the
+    card stays expanded — nobody loses content on an unsupported client.
+
+    The <label> physically WRAPS the checkbox (and the collapsible content)
+    rather than using a separate for=/id= pairing — Gmail's HTML sanitizer
+    is documented to not support for=/id= label association, only the
+    wrapping pattern, so this is required for the toggle to work there at all.
     """
     is_warn = bg is not None  # only the discrepancy-alert card passes a custom bg today
     bg = bg or "#ffffff"
@@ -891,18 +895,17 @@ def _html_card(title_html, inner_html, source_html, accent=None, accent_key=None
     return (
         f'<div class="{card_class}" style="border:1px solid {border};border-left:{left_border};border-radius:8px;'
         f'padding:16px 18px;margin-bottom:16px;background:{bg};">'
+        f'<label class="crx-card-label" style="display:block;cursor:pointer;">'
         f'<input type="checkbox" id="{toggle_id}" class="crx-toggle-checkbox" style="display:none !important;">'
-        f'<label for="{toggle_id}" class="crx-card-label" style="display:block;cursor:pointer;margin-bottom:2px;">'
         f'<span class="crx-chevron-open" style="font-size:11px;color:{_HTML_COLORS["muted"]};display:inline-block;width:14px;">&#9662;</span>'
         f'<span class="crx-chevron-closed" style="display:none;font-size:11px;color:{_HTML_COLORS["muted"]};width:14px;">&#9656;</span>'
         f'<span class="{title_class}" style="font-size:15px;font-weight:700;color:{title_color};">{dot}{title_html}</span>'
-        f'</label>'
-        f'<div class="crx-collapsible">'
+        f'<div class="crx-collapsible" style="margin-top:2px;">'
         f'<div class="crx-muted" style="font-size:11px;color:{_HTML_COLORS["muted"]};margin-bottom:4px;'
         f'text-transform:uppercase;letter-spacing:.03em;">{source_html}</div>'
         f"{desc_html}"
         f"{inner_html}"
-        f"</div></div>"
+        f"</div></label></div>"
     )
 
 
