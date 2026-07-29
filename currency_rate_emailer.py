@@ -493,6 +493,31 @@ def collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates, coing
     return comparable
 
 
+def quick_summary_section(rates, previous_rates):
+    """A compact, one-line-per-currency glance at the very top of the email —
+    market mid-rate plus day-over-day change, nothing else. Pure static HTML,
+    no interactivity, so it works identically on desktop and mobile. The
+    detailed per-source cards stay below for anyone who wants to dig in, but
+    nobody has to scroll past them just to see today's numbers.
+    """
+    if not rates:
+        return None
+    lines = ["Xem nhanh (tỷ giá trung bình thị trường)"]
+    lines.append("-" * 38)
+    for code in WATCHLIST:
+        if code not in rates:
+            continue
+        rate = rates[code]
+        change_str = ""
+        if previous_rates and code in previous_rates:
+            prev = previous_rates[code]
+            pct = (rate - prev) / prev * 100
+            arrow = "TĂNG" if pct > 0 else ("GIẢM" if pct < 0 else "KHÔNG ĐỔI")
+            change_str = f"  {arrow} {pct:+.2f}%"
+        lines.append(f"{label_for(code):<14}{rate:,.2f} VND{change_str}")
+    return lines
+
+
 def best_rate_section(comparable):
     """For each currency with 2+ sources, shows which source gives the most/least VND."""
     lines = []
@@ -599,6 +624,10 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
                        vcb_error=None, fawaz_error=None, fxrates_error=None, coingecko_error=None,
                        market_error=None):
     lines = [f"Tỷ giá quy đổi sang VND - {now_vn().strftime('%Y-%m-%d %H:%M')}\n"]
+
+    summary = quick_summary_section(rates, previous_rates)
+    if summary:
+        lines += summary + [""]
 
     comparable = collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates)
 
@@ -862,17 +891,12 @@ def _html_card(title_html, inner_html, source_html, accent=None, accent_key=None
     text color independently (see SECTION_ACCENTS_DARK) without touching the
     left border, which stays the same accent color in both modes.
 
-    Each card is collapsible via a CSS-only checkbox toggle (no JavaScript,
-    since email clients strip it) — click the title to collapse/expand.
-    IMPORTANT: this defaults to EXPANDED, and checking the box COLLAPSES it
-    (not the more common reverse pattern). Email clients that don't support
-    this CSS technique at all just show an inert, hidden checkbox and the
-    card stays expanded — nobody loses content on an unsupported client.
-
-    The <label> physically WRAPS the checkbox (and the collapsible content)
-    rather than using a separate for=/id= pairing — Gmail's HTML sanitizer
-    is documented to not support for=/id= label association, only the
-    wrapping pattern, so this is required for the toggle to work there at all.
+    NOTE: cards are plain (not collapsible) — Gmail's webmail CSS engine does
+    not support :checked, :target, or any pseudo-class capable of holding a
+    persistent open/closed state (confirmed against Gmail's documented
+    supported-selector list), so a CSS-only collapse/expand toggle genuinely
+    cannot work there. See quick_summary_section() / the HTML equivalent for
+    the glanceable-summary approach used instead.
     """
     is_warn = bg is not None  # only the discrepancy-alert card passes a custom bg today
     bg = bg or "#ffffff"
@@ -891,21 +915,14 @@ def _html_card(title_html, inner_html, source_html, accent=None, accent_key=None
         f'{_html_escape(description)}</div>'
         if description else ""
     )
-    toggle_id = _next_card_id()
     return (
         f'<div class="{card_class}" style="border:1px solid {border};border-left:{left_border};border-radius:8px;'
         f'padding:16px 18px;margin-bottom:16px;background:{bg};">'
-        f'<label class="crx-card-label" style="display:block;cursor:pointer;">'
-        f'<input type="checkbox" id="{toggle_id}" class="crx-toggle-checkbox" style="display:none !important;">'
-        f'<span class="crx-chevron-open" style="font-size:11px;color:{_HTML_COLORS["muted"]};display:inline-block;width:14px;">&#9662;</span>'
-        f'<span class="crx-chevron-closed" style="display:none;font-size:11px;color:{_HTML_COLORS["muted"]};width:14px;">&#9656;</span>'
-        f'<span class="{title_class}" style="font-size:15px;font-weight:700;color:{title_color};">{dot}{title_html}</span>'
-        f'<div class="crx-collapsible" style="margin-top:2px;">'
+        f'<div class="{title_class}" style="font-size:15px;font-weight:700;color:{title_color};margin-bottom:2px;">{dot}{title_html}</div>'
         f'<div class="crx-muted" style="font-size:11px;color:{_HTML_COLORS["muted"]};margin-bottom:4px;'
         f'text-transform:uppercase;letter-spacing:.03em;">{source_html}</div>'
         f"{desc_html}"
-        f"{inner_html}"
-        f"</div></label></div>"
+        f"{inner_html}</div>"
     )
 
 
@@ -916,21 +933,6 @@ def _html_source_label(name, url):
     return f"Nguồn: {_html_escape(name)}"
 
 
-# Unique IDs for the collapsible-card checkboxes below, reset at the start of
-# each top-level email-building function so IDs never collide within one
-# render and don't grow unbounded across multiple emails in the same process.
-_card_id_counter = [0]
-
-
-def _next_card_id():
-    _card_id_counter[0] += 1
-    return f"crx-toggle-{_card_id_counter[0]}"
-
-
-def _reset_card_id_counter():
-    _card_id_counter[0] = 0
-
-
 # Dark-mode support for Gmail/Outlook/Apple Mail. Inline styles normally win
 # over stylesheets, so this uses `!important` in a <head><style> block to
 # override them specifically inside a `prefers-color-scheme: dark` query —
@@ -939,6 +941,10 @@ def _reset_card_id_counter():
 # stripe stays the same vivid color in both light and dark mode.
 _DARK_MODE_STYLE_BLOCK = """
     @media (prefers-color-scheme: dark) {
+      .crx-summary {
+        background: #16211f !important;
+        color: #e8e8e8 !important;
+      }
       .crx-card {
         background: #1e1e1e !important;
         border-top-color: #3a3a3a !important;
@@ -967,29 +973,17 @@ _DARK_MODE_STYLE_BLOCK = """
 """
 
 
-# CSS-only collapsible sections (checkbox hack — no JavaScript, since email
-# clients strip it). Defaults to EXPANDED; checking the box COLLAPSES the
-# card, which is the safer default for clients that don't support this
-# technique at all (they just see an inert checkbox, content stays visible).
-_COLLAPSIBLE_STYLE_BLOCK = """
-    .crx-toggle-checkbox:checked ~ .crx-collapsible { display: none !important; }
-    .crx-toggle-checkbox:checked ~ .crx-card-label .crx-chevron-open { display: none !important; }
-    .crx-toggle-checkbox:checked ~ .crx-card-label .crx-chevron-closed { display: inline-block !important; }
-"""
-
-
 def _html_document(body_html):
     """Wraps a body fragment in a full HTML document with the meta tags and
     <style> block email clients need to apply real dark-mode support instead
-    of their own automatic (often ugly) light-to-dark inversion heuristics,
-    plus the CSS for the collapsible-section checkbox toggles.
+    of their own automatic (often ugly) light-to-dark inversion heuristics.
     """
     return (
         "<!DOCTYPE html>"
         '<html><head><meta charset="utf-8">'
         '<meta name="color-scheme" content="light dark">'
         '<meta name="supported-color-schemes" content="light dark">'
-        f"<style>{_COLLAPSIBLE_STYLE_BLOCK}{_DARK_MODE_STYLE_BLOCK}</style>"
+        f"<style>{_DARK_MODE_STYLE_BLOCK}</style>"
         f"</head><body style=\"margin:0;padding:0;\">{body_html}</body></html>"
     )
 
@@ -997,7 +991,6 @@ def _html_document(body_html):
 def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
                        vcb_error=None, fawaz_error=None, fxrates_error=None, coingecko_error=None,
                        market_error=None):
-    _reset_card_id_counter()
     C = _HTML_COLORS
     comparable = collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates)
     used_sources = []
@@ -1015,6 +1008,40 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         f"{now_vn().strftime('%Y-%m-%d %H:%M')} (giờ Việt Nam)</div>"
         f'</div>'
     )
+
+    # Quick-glance summary — deliberately NOT a card like the sections below,
+    # so it reads as "the highlights" rather than one more thing to scroll
+    # past. Same info on any device, no interactivity needed to see it.
+    # Uses a plain <table> rather than flexbox/grid, since flexbox has no
+    # reliable support across email clients (Outlook desktop supports none
+    # of it) while tables are the one layout mechanism every client renders
+    # consistently.
+    if rates:
+        summary_rows = ""
+        for code in WATCHLIST:
+            if code not in rates:
+                continue
+            rate = rates[code]
+            change_cell = ""
+            if previous_rates and code in previous_rates:
+                prev = previous_rates[code]
+                pct = (rate - prev) / prev * 100
+                change_cell = _html_change_span(pct)
+            summary_rows += (
+                f'<tr>'
+                f'<td class="crx-td" style="padding:7px 0;border-bottom:1px solid rgba(0,0,0,0.06);font-size:14px;">{_html_label(code)}</td>'
+                f'<td class="crx-td" style="padding:7px 0;border-bottom:1px solid rgba(0,0,0,0.06);font-size:14px;font-weight:600;text-align:right;">{rate:,.2f} VND</td>'
+                f'<td class="crx-td" style="padding:7px 0 7px 12px;border-bottom:1px solid rgba(0,0,0,0.06);text-align:right;">{change_cell}</td>'
+                f'</tr>'
+            )
+        parts.append(
+            f'<div class="crx-summary" style="background:{_tint(SECTION_ACCENTS["market"], 0.94)};border-radius:10px;'
+            f'padding:14px 18px 6px;margin-bottom:20px;">'
+            f'<div class="crx-muted" style="font-size:12px;font-weight:700;color:{_HTML_COLORS["muted"]};text-transform:uppercase;'
+            f'letter-spacing:.03em;margin-bottom:6px;">Xem nhanh &middot; tỷ giá trung bình thị trường</div>'
+            f'<table style="border-collapse:collapse;width:100%;">{summary_rows}</table>'
+            f'</div>'
+        )
 
     # Best / lowest rate by source
     best_rows = []
