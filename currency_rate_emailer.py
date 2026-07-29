@@ -1043,6 +1043,21 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
             f'</div>'
         )
 
+    # TEMPORARY TEST BLOCK — checks whether Gmail respects the native
+    # <details>/<summary> toggle (browser-built-in behavior, not a CSS trick,
+    # so it isn't subject to the :checked/:target limitations already ruled
+    # out). Remove this block once confirmed working or not working.
+    parts.append(
+        '<details style="border:2px dashed #d97706;border-radius:8px;padding:12px 16px;margin-bottom:20px;background:#fffbeb;">'
+        '<summary style="cursor:pointer;font-weight:700;color:#92400e;">'
+        '&#129514; THỬ NGHIỆM: Bấm vào đây — nếu bạn thấy dòng chữ bên dưới xuất hiện/biến mất, tính năng thu gọn CÓ hoạt động</summary>'
+        '<div style="margin-top:10px;font-size:14px;color:#92400e;">'
+        'Nếu bạn đang đọc được dòng này sau khi bấm, nghĩa là &lt;details&gt;/&lt;summary&gt; hoạt động trong Gmail của bạn — '
+        'có thể áp dụng cách thu gọn này cho tất cả các phần trong email.'
+        '</div>'
+        '</details>'
+    )
+
     # Best / lowest rate by source
     best_rows = []
     for code in WATCHLIST:
