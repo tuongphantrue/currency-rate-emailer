@@ -76,7 +76,7 @@ def now_vn():
     return datetime.now(VN_TZ)
 
 
-DEFAULT_WATCHLIST = ["USD", "EUR", "JPY", "CNY", "KRW", "GBP", "SGD", "AUD"]
+DEFAULT_WATCHLIST = ["USD", "EUR", "JPY", "CNY", "KRW", "GBP", "SGD", "AUD", "CAD", "CHF", "HKD", "THB", "INR"]
 WATCHLIST = os.environ.get("WATCHLIST", ",".join(DEFAULT_WATCHLIST)).split(",")
 WATCHLIST = [c.strip() for c in WATCHLIST]
 
