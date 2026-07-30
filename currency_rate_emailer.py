@@ -95,6 +95,46 @@ def symbol_for(code):
     return CURRENCY_SYMBOLS.get(code, code)
 
 
+# Currency name + country/region, in Vietnamese, shown in the quick-summary
+# table so codes like "THB" or "HKD" are identifiable without prior knowledge.
+CURRENCY_NAMES = {
+    "USD": "Đô la Mỹ (Hoa Kỳ)",
+    "EUR": "Euro (Khu vực đồng Euro)",
+    "JPY": "Yên Nhật (Nhật Bản)",
+    "CNY": "Nhân dân tệ (Trung Quốc)",
+    "KRW": "Won (Hàn Quốc)",
+    "GBP": "Bảng Anh (Vương quốc Anh)",
+    "SGD": "Đô la Singapore (Singapore)",
+    "AUD": "Đô la Úc (Úc)",
+    "CAD": "Đô la Canada (Canada)",
+    "CHF": "Franc Thụy Sĩ (Thụy Sĩ)",
+    "HKD": "Đô la Hồng Kông (Hồng Kông)",
+    "THB": "Baht (Thái Lan)",
+    "INR": "Rupee (Ấn Độ)",
+    "VND": "Đồng (Việt Nam)",
+    "NZD": "Đô la New Zealand (New Zealand)",
+    "IDR": "Rupiah (Indonesia)",
+    "MYR": "Ringgit (Malaysia)",
+    "PHP": "Peso (Philippines)",
+    "RUB": "Rúp (Nga)",
+    "TWD": "Đô la Đài Loan (Đài Loan)",
+    "CZK": "Koruna (Séc)",
+    "SEK": "Krona (Thụy Điển)",
+    "NOK": "Krone (Na Uy)",
+    "DKK": "Krone (Đan Mạch)",
+    "PLN": "Zloty (Ba Lan)",
+    "TRY": "Lira (Thổ Nhĩ Kỳ)",
+    "ZAR": "Rand (Nam Phi)",
+    "BRL": "Real (Brazil)",
+    "MXN": "Peso (Mexico)",
+    "AED": "Dirham (UAE)",
+}
+
+
+def currency_name_for(code):
+    return CURRENCY_NAMES.get(code, "")
+
+
 def label_for(code):
     """Currency code with its symbol, e.g. 'USD $'."""
     sym = CURRENCY_SYMBOLS.get(code)
@@ -508,6 +548,7 @@ def quick_summary_section(rates, previous_rates):
         if code not in rates:
             continue
         rate = rates[code]
+        name = currency_name_for(code)
         change_str = ""
         if previous_rates and code in previous_rates:
             prev = previous_rates[code]
@@ -515,6 +556,8 @@ def quick_summary_section(rates, previous_rates):
             arrow = "TĂNG" if pct > 0 else ("GIẢM" if pct < 0 else "KHÔNG ĐỔI")
             change_str = f"  {arrow} {pct:+.2f}%"
         lines.append(f"{label_for(code):<14}{rate:,.2f} VND{change_str}")
+        if name:
+            lines.append(f"{'':<14}{name}")
     return lines
 
 
@@ -1022,6 +1065,7 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
             if code not in rates:
                 continue
             rate = rates[code]
+            name = currency_name_for(code)
             change_cell = ""
             if previous_rates and code in previous_rates:
                 prev = previous_rates[code]
@@ -1030,6 +1074,7 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
             summary_rows += (
                 f'<tr>'
                 f'<td class="crx-td" style="padding:7px 0;border-bottom:1px solid rgba(0,0,0,0.06);font-size:14px;">{_html_label(code)}</td>'
+                f'<td class="crx-td crx-muted" style="padding:7px 10px;border-bottom:1px solid rgba(0,0,0,0.06);font-size:12.5px;color:{_HTML_COLORS["muted"]};">{_html_escape(name)}</td>'
                 f'<td class="crx-td" style="padding:7px 0;border-bottom:1px solid rgba(0,0,0,0.06);font-size:14px;font-weight:600;text-align:right;">{rate:,.2f} VND</td>'
                 f'<td class="crx-td" style="padding:7px 0 7px 12px;border-bottom:1px solid rgba(0,0,0,0.06);text-align:right;">{change_cell}</td>'
                 f'</tr>'
