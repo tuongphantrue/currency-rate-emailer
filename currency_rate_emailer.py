@@ -416,7 +416,7 @@ def load_previous_rates():
     if not os.path.exists(STATE_FILE):
         return None
     try:
-        with open(STATE_FILE) as f:
+        with open(STATE_FILE, encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) and data else None
     except (json.JSONDecodeError, ValueError, OSError) as e:
@@ -425,7 +425,7 @@ def load_previous_rates():
 
 
 def save_rates(rates):
-    with open(STATE_FILE, "w") as f:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(rates, f)
 
 
@@ -445,7 +445,7 @@ def should_send(rates, previous_rates):
 def append_history(rates):
     """Appends this run's market rates to a CSV: timestamp,currency,rate"""
     is_new_file = not os.path.exists(HISTORY_FILE)
-    with open(HISTORY_FILE, "a", newline="") as f:
+    with open(HISTORY_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         if is_new_file:
             writer.writerow(["timestamp", "currency", "rate"])
@@ -479,7 +479,7 @@ def weekly_trend_rows():
     oldest_near_cutoff = {}  # currency -> (timestamp, rate) closest to 7 days ago
     latest = {}  # currency -> (timestamp, rate) most recent
 
-    with open(HISTORY_FILE) as f:
+    with open(HISTORY_FILE, encoding="utf-8") as f:
         for row in csv.DictReader(f):
             try:
                 ts = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M").replace(tzinfo=VN_TZ)
@@ -494,11 +494,20 @@ def weekly_trend_rows():
             if ts <= cutoff and (code not in oldest_near_cutoff or ts > oldest_near_cutoff[code][0]):
                 oldest_near_cutoff[code] = (ts, rate)
 
+    # The workflow runs twice during the Monday 00:xx window. Once a row from
+    # this week's slot is already present, the first run has produced the
+    # weekly summary and appended its history, so later runs should not repeat
+    # the same section.
+    if any(ts.date() == vn_now.date() and ts.hour == 0 for ts, _ in latest.values()):
+        return None
+
     rows = []
     for code in WATCHLIST:
         if code in latest and code in oldest_near_cutoff:
             _, old_rate = oldest_near_cutoff[code]
             _, new_rate = latest[code]
+            if old_rate == 0:
+                continue
             pct = (new_rate - old_rate) / old_rate * 100
             arrow = "TĂNG" if pct > 0 else ("GIẢM" if pct < 0 else "KHÔNG ĐỔI")
             rows.append({"code": code, "pct": pct, "arrow": arrow})
@@ -518,8 +527,16 @@ def collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates, coing
         comparable[code][SOURCES[0][0]] = rate
 
     for code, vals in vcb_rates.items():
-        avg = (vals["buy"] + vals["sell"]) / 2
-        comparable[code][SOURCES[1][0]] = avg
+        # Some currencies occasionally omit either the buy or sell quote. The
+        # parser represents a missing side as 0.0; averaging that zero with the
+        # valid side would create a fictitious half-price rate and trigger false
+        # best-rate/discrepancy alerts. Average only the quotes that exist.
+        available_quotes = [
+            value for value in (vals.get("buy"), vals.get("sell"))
+            if isinstance(value, (int, float)) and value > 0
+        ]
+        if available_quotes:
+            comparable[code][SOURCES[1][0]] = sum(available_quotes) / len(available_quotes)
 
     for code, rate in fawaz_rates.items():
         comparable[code][SOURCES[2][0]] = rate
@@ -1381,7 +1398,7 @@ def cmd_generate():
     # skipped by a threshold check that has nothing to compare.
     if rates and not should_send(rates, previous_rates):
         print("No significant change, skipping email.")
-        open(EMAIL_BODY_FILE, "w").close()
+        open(EMAIL_BODY_FILE, "w", encoding="utf-8").close()
         return
 
     try:
@@ -1433,11 +1450,11 @@ def cmd_generate():
         body = build_alert_body_text(errors)
         html_body = build_alert_body_html(errors)
         subject = f"🚨 CẢNH BÁO: Tất cả nguồn tỷ giá đều lỗi - {now_vn().strftime('%Y-%m-%d %H:%M')}"
-        with open(EMAIL_BODY_FILE, "w") as f:
+        with open(EMAIL_BODY_FILE, "w", encoding="utf-8") as f:
             f.write(body)
-        with open(EMAIL_HTML_FILE, "w") as f:
+        with open(EMAIL_HTML_FILE, "w", encoding="utf-8") as f:
             f.write(html_body)
-        with open(EMAIL_SUBJECT_FILE, "w") as f:
+        with open(EMAIL_SUBJECT_FILE, "w", encoding="utf-8") as f:
             f.write(subject)
         print(body)
         # No new data was fetched — don't overwrite the rate cache or history.
@@ -1447,9 +1464,9 @@ def cmd_generate():
                               vcb_error, fawaz_error, fxrates_error, coingecko_error, market_error)
     html_body = format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
                                    vcb_error, fawaz_error, fxrates_error, coingecko_error, market_error)
-    with open(EMAIL_BODY_FILE, "w") as f:
+    with open(EMAIL_BODY_FILE, "w", encoding="utf-8") as f:
         f.write(body)
-    with open(EMAIL_HTML_FILE, "w") as f:
+    with open(EMAIL_HTML_FILE, "w", encoding="utf-8") as f:
         f.write(html_body)
     # Clear any leftover alert subject from a previous failed run, so a normal
     # run always uses the normal subject format.
@@ -1467,7 +1484,7 @@ def cmd_send():
         print("No email body found, run 'generate' first.")
         return
 
-    with open(EMAIL_BODY_FILE) as f:
+    with open(EMAIL_BODY_FILE, encoding="utf-8") as f:
         body = f.read()
 
     if not body.strip():
@@ -1476,17 +1493,20 @@ def cmd_send():
 
     html_body = None
     if os.path.exists(EMAIL_HTML_FILE):
-        with open(EMAIL_HTML_FILE) as f:
+        with open(EMAIL_HTML_FILE, encoding="utf-8") as f:
             html_body = f.read().strip() or None
 
     subject = None
     if os.path.exists(EMAIL_SUBJECT_FILE):
-        with open(EMAIL_SUBJECT_FILE) as f:
+        with open(EMAIL_SUBJECT_FILE, encoding="utf-8") as f:
             subject = f.read().strip() or None
 
     if not (GMAIL_ADDRESS and GMAIL_APP_PASSWORD and CURRENCY_RECIPIENT):
-        print("GMAIL_ADDRESS / GMAIL_APP_PASSWORD / CURRENCY_RECIPIENT not set, skipping send.")
-        return
+        print(
+            "GMAIL_ADDRESS / GMAIL_APP_PASSWORD / CURRENCY_RECIPIENT not set; cannot send.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     send_email(body, html_body, subject)
     print("Email sent.")

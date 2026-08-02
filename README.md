@@ -129,7 +129,7 @@ When the alert threshold is enabled and no significant change is found, `email_b
 
 - If one or more sources fail, the email identifies the failed sources and includes data from those that succeeded.
 - If all five sources fail, the script creates a dedicated failure alert and does not overwrite the rate cache or history.
-- If the Gmail environment variables are missing, the `send` command exits without attempting SMTP delivery.
+- If the Gmail environment variables are missing, the `send` command exits with an error without attempting SMTP delivery, so automation cannot report a false success.
 - Network requests use retries and backoff for rate limits and common transient server errors.
 
 ## Security
