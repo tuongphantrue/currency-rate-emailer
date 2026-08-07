@@ -274,6 +274,19 @@ CHART_SPECS = [
 ]
 CHART_FILE_TEMPLATE = "chart_{}.png"  # -> chart_1w.png, chart_1m.png, chart_1y.png
 
+
+def _chart_cid(key):
+    """Content-ID (no angle brackets, no 'cid:' prefix) for a chart range key.
+    RFC 2392 defines a Content-ID as an addr-spec — local-part@domain, the
+    same shape as a Message-ID — not a bare token. A bare '<chart-1w>' is
+    what most tutorial snippets use and it's tolerated by several desktop
+    clients, but it's non-conformant, and Gmail's web client in particular
+    has been observed falling back to showing the image as a plain
+    attachment instead of resolving it inline when the id isn't in this
+    form. Used identically at HTML-build time (cid:<this>) and at
+    send time (Content-ID: <<this>>) so the two can't drift apart."""
+    return f"chart-{key}@currency-rate-emailer"
+
 # Which currencies to plot. Defaults to the full watchlist; can be narrowed
 # (e.g. "USD,EUR") if 13 overlaid lines feels cluttered.
 _chart_currencies_env = os.environ.get("CHART_CURRENCIES")
@@ -1488,7 +1501,7 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
             )
             if r["ok"]:
                 blocks.append(
-                    f'<img src="cid:chart-{r["key"]}" width="600" alt="Biểu đồ tỷ giá {_html_escape(r["label"])}" '
+                    f'<img src="cid:{_chart_cid(r["key"])}" width="600" alt="Biểu đồ tỷ giá {_html_escape(r["label"])}" '
                     f'style="width:100%;max-width:600px;height:auto;display:block;border-radius:6px;border:1px solid {C["border"]};">'
                 )
                 if r["coverage_days"] < r["days"] - 1:
@@ -1532,7 +1545,7 @@ def send_email(body, html_body=None, subject=None):
         alt.attach(MIMEText(html_body, "html", "utf-8"))
 
         # Any chart PNGs generate_rate_charts() left on disk this run get attached
-        # as inline images, matched to the <img src="cid:chart-1w"> etc. references
+        # as inline images, matched to the <img src="cid:chart-1w@..."> etc. references
         # already baked into html_body. Missing files (range had no chart this run)
         # are simply skipped — the HTML only ever references charts that exist.
         chart_paths = [
@@ -1544,8 +1557,8 @@ def send_email(body, html_body=None, subject=None):
             msg.attach(alt)
             for key, path in chart_paths:
                 with open(path, "rb") as f:
-                    img = MIMEImage(f.read(), _subtype="png")
-                img.add_header("Content-ID", f"<chart-{key}>")
+                    img = MIMEImage(f.read(), _subtype="png", name=os.path.basename(path))
+                img.add_header("Content-ID", f"<{_chart_cid(key)}>")
                 img.add_header("Content-Disposition", "inline", filename=os.path.basename(path))
                 msg.attach(img)
         else:
