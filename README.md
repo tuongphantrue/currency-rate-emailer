@@ -13,6 +13,7 @@ The included workflow runs every 30 minutes. GitHub Actions may start scheduled 
 - Includes a side-by-side all-sources comparison table
 - Converts common VND amounts into every watched currency
 - Records rate history and includes a weekly trend summary
+- Includes 1-week / 1-month / 1-year rate charts, embedded as images in the HTML email
 - Sends both plain-text and responsive HTML email content
 - Continues with a partial digest when individual sources fail
 - Sends a distinct alert when every source fails
@@ -101,6 +102,7 @@ The script reads the following optional environment variables:
 | `ALERT_THRESHOLD_PERCENT` | unset | Only produce a normal digest when at least one market rate changes by this percentage; unset means always produce it |
 | `DISCREPANCY_THRESHOLD_PERCENT` | `1.0` | Flag a currency when the spread between sources reaches this percentage |
 | `CONVERT_AMOUNTS_VND` | `1000000,5000000,10000000` | Comma-separated VND amounts for the quick-conversion table |
+| `CHART_CURRENCIES` | full watchlist | Comma-separated ISO currency codes to plot on the 1w/1m/1y rate charts. Narrow this if 13 overlaid lines feels cluttered, e.g. `USD,EUR,JPY` |
 
 For local runs, set these variables in the shell before `generate`. For GitHub Actions, expose the desired values to the **Generate email** step. The checked-in workflow intentionally leaves `ALERT_THRESHOLD_PERCENT` empty, so every run with usable data can generate a digest.
 
@@ -121,7 +123,8 @@ python currency_rate_emailer.py generate
 | `email_body.html` | Generated HTML email body |
 | `email_subject.txt` | Custom subject used for an all-sources-failed alert |
 | `last_rates.json` | Most recently stored market rates |
-| `rate_history.csv` | Historical market rates used for weekly trends |
+| `rate_history.csv` | Historical market rates used for weekly trends and the rate charts |
+| `chart_1w.png`, `chart_1m.png`, `chart_1y.png` | Generated 1-week / 1-month / 1-year rate charts, embedded inline in the HTML email |
 
 When the alert threshold is enabled and no significant change is found, `email_body.txt` is emptied and the `send` command exits without sending anything.
 
