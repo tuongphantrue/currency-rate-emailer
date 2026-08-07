@@ -72,6 +72,7 @@ import matplotlib
 matplotlib.use("Agg")  # no display on GitHub Actions runners / most servers
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+from matplotlib.ticker import MaxNLocator
 
 # --- Config -------------------------------------------------------------
 
@@ -288,20 +289,11 @@ def _chart_cid(key):
     return f"chart-{key}@currency-rate-emailer"
 
 # Which currencies to plot. Defaults to the full watchlist; can be narrowed
-# (e.g. "USD,EUR") if 13 overlaid lines feels cluttered.
+# (e.g. "USD,EUR") if 13 panels feels like too many.
 _chart_currencies_env = os.environ.get("CHART_CURRENCIES")
 CHART_CURRENCIES = (
     [c.strip() for c in _chart_currencies_env.split(",")] if _chart_currencies_env else list(WATCHLIST)
 )
-
-# A distinct, high-contrast color per line. Deliberately separate from
-# CURRENCY_DOT_COLORS above: those colors repeat on purpose (they're just a
-# small accent next to a text label elsewhere in the email), which would make
-# several lines on the same chart indistinguishable by color alone.
-CHART_LINE_COLORS = [
-    "#2563eb", "#dc2626", "#059669", "#7c3aed", "#ea580c", "#0891b2",
-    "#db2777", "#65a30d", "#9333ea", "#0d9488", "#ca8a04", "#4f46e5", "#e11d48",
-]
 
 ALERT_THRESHOLD_PERCENT = os.environ.get("ALERT_THRESHOLD_PERCENT")
 ALERT_THRESHOLD_PERCENT = float(ALERT_THRESHOLD_PERCENT) if ALERT_THRESHOLD_PERCENT else None
@@ -581,16 +573,19 @@ def _read_history_rows():
 
 
 def render_rate_chart(history_rows, days):
-    """Builds a % change line chart from pre-parsed history_rows (as returned
-    by _read_history_rows(), optionally with this run's not-yet-saved rates
-    appended), one line per CHART_CURRENCIES currency, over the trailing
-    `days` days.
+    """Builds a grid of small per-currency charts — one panel per
+    CHART_CURRENCIES currency, each showing that currency's own raw VND
+    rate as a line — over the trailing `days` days.
 
-    Percent change is plotted relative to each currency's own first data
-    point inside the window, rather than the raw VND rate, because the
-    watchlist spans currencies on wildly different scales (JPY ~165 VND vs.
-    USD ~26,000 VND) that would be unreadable stacked on one raw axis —
-    normalizing to % change puts every currency on the same footing.
+    Earlier this plotted all currencies as % change overlaid on one shared
+    axis, but with the full watchlist (13 currencies) that made individual
+    lines impossible to tell apart even with distinct colors. Splitting
+    into one small panel per currency, each with its own independent
+    y-axis, means every currency gets legible room regardless of how much
+    (or little) it moved relative to the others — and each panel can reuse
+    that currency's CURRENCY_DOT_COLORS accent for visual consistency with
+    the rest of the email, since panels no longer compete for distinguishable
+    colors the way overlaid lines did.
 
     Returns (png_bytes, earliest_timestamp_plotted), or None if no currency
     has at least 2 data points in the window (nothing usable to plot).
@@ -607,36 +602,26 @@ def render_rate_chart(history_rows, days):
     latest = None
     for code, points in by_code.items():
         points.sort(key=lambda p: p[0])
-        if len(points) < 2 or points[0][1] == 0:
+        if len(points) < 2:
             continue
-        base = points[0][1]
-        series[code] = [(ts, (rate - base) / base * 100) for ts, rate in points]
+        series[code] = points
         earliest = points[0][0] if earliest is None else min(earliest, points[0][0])
         latest = points[-1][0] if latest is None else max(latest, points[-1][0])
 
     if not series:
         return None
 
-    fig, ax = plt.subplots(figsize=(7.4, 4.0), dpi=180)
+    plotted_codes = [c for c in WATCHLIST if c in series]
+    n = len(plotted_codes)
+    cols = min(3, n)
+    rows = (n + cols - 1) // cols  # ceil division
+
+    fig, axes = plt.subplots(
+        rows, cols, figsize=(3.05 * cols, 2.15 * rows), dpi=170,
+        sharex=True, squeeze=False,
+    )
     fig.patch.set_facecolor("#ffffff")  # fixed white background: the image can't
-    ax.set_facecolor("#ffffff")         # respond to the email's dark-mode CSS
-
-    for i, code in enumerate(c for c in WATCHLIST if c in series):
-        points = series[code]
-        ax.plot(
-            [p[0] for p in points], [p[1] for p in points],
-            label=code, color=CHART_LINE_COLORS[i % len(CHART_LINE_COLORS)],
-            linewidth=1.8, solid_capstyle="round",
-        )
-
-    ax.axhline(0, color="#c7ccd1", linewidth=0.8, linestyle="--", zorder=0)
-    ax.set_ylabel("Thay đổi so với đầu kỳ (%)", fontsize=9, color="#57606a")
-    ax.tick_params(labelsize=8, colors="#57606a")
-    ax.grid(axis="y", color="#eef0f2", linewidth=0.8)
-    for spine in ("top", "right"):
-        ax.spines[spine].set_visible(False)
-    for spine in ("left", "bottom"):
-        ax.spines[spine].set_color("#e1e4e8")
+                                         # respond to the email's dark-mode CSS
 
     # Formatted by the actual plotted span, not the nominal `days` window —
     # early on, a project has far less history than a requested "1 year"
@@ -649,12 +634,34 @@ def render_rate_chart(history_rows, days):
         date_fmt = "%d/%m"
     else:
         date_fmt = "%m/%Y"
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=8, tz=VN_TZ))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter(date_fmt, tz=VN_TZ))
-    fig.autofmt_xdate(rotation=30, ha="right")
 
-    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8, frameon=False, borderaxespad=0)
-    fig.tight_layout()
+    for idx, ax in enumerate(axes.flat):
+        ax.set_facecolor("#ffffff")
+        if idx >= n:
+            ax.axis("off")  # unused grid cell when n doesn't fill the last row
+            continue
+
+        code = plotted_codes[idx]
+        points = series[code]
+        color = CURRENCY_DOT_COLORS.get(code, "#2563eb")
+        ax.plot(
+            [p[0] for p in points], [p[1] for p in points],
+            color=color, linewidth=1.6, solid_capstyle="round",
+        )
+        ax.set_title(code, fontsize=10, fontweight="bold", color="#1f2328", loc="left", pad=3)
+        ax.tick_params(labelsize=7, colors="#57606a")
+        ax.grid(axis="y", color="#eef0f2", linewidth=0.7)
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+        for spine in ("left", "bottom"):
+            ax.spines[spine].set_color("#e1e4e8")
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=2, maxticks=4, tz=VN_TZ))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter(date_fmt, tz=VN_TZ))
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=4))
+        ax.label_outer()  # tick labels only on the outer edge of the grid
+
+    fig.autofmt_xdate(rotation=30, ha="right")
+    fig.tight_layout(h_pad=1.4, w_pad=1.2)
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", facecolor="#ffffff")
@@ -1518,8 +1525,8 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
             "Biểu đồ tỷ giá theo thời gian", "".join(blocks),
             f"Tính theo lịch sử {_html_escape(SOURCES[0][0])}, ghi lại mỗi lần chạy",
             accent=chart_accent, accent_key="chart",
-            description="Phần trăm thay đổi so với đầu mỗi khoảng thời gian, theo từng loại tiền trong danh sách theo dõi "
-                         "(quy về cùng thang đo vì các loại tiền chênh lệch giá trị rất lớn).",
+            description="Mỗi loại tiền một biểu đồ riêng (tỷ giá VND thực tế theo thời gian), để dễ theo dõi từng loại "
+                         "thay vì chồng lên nhau trên cùng một trục.",
         ))
 
     # Sources footer
