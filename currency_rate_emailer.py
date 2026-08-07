@@ -56,6 +56,7 @@ import os
 import re
 import sys
 import csv
+import io
 import json
 import time
 import smtplib
@@ -63,9 +64,14 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 
 import requests
+import matplotlib
+matplotlib.use("Agg")  # no display on GitHub Actions runners / most servers
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 # --- Config -------------------------------------------------------------
 
@@ -259,6 +265,30 @@ EMAIL_HTML_FILE = "email_body.html"
 EMAIL_SUBJECT_FILE = "email_subject.txt"
 STATE_FILE = "last_rates.json"
 HISTORY_FILE = "rate_history.csv"
+
+# (range key, trailing days, Vietnamese label) for the three rate charts.
+CHART_SPECS = [
+    ("1w", 7, "1 tuần"),
+    ("1m", 30, "1 tháng"),
+    ("1y", 365, "1 năm"),
+]
+CHART_FILE_TEMPLATE = "chart_{}.png"  # -> chart_1w.png, chart_1m.png, chart_1y.png
+
+# Which currencies to plot. Defaults to the full watchlist; can be narrowed
+# (e.g. "USD,EUR") if 13 overlaid lines feels cluttered.
+_chart_currencies_env = os.environ.get("CHART_CURRENCIES")
+CHART_CURRENCIES = (
+    [c.strip() for c in _chart_currencies_env.split(",")] if _chart_currencies_env else list(WATCHLIST)
+)
+
+# A distinct, high-contrast color per line. Deliberately separate from
+# CURRENCY_DOT_COLORS above: those colors repeat on purpose (they're just a
+# small accent next to a text label elsewhere in the email), which would make
+# several lines on the same chart indistinguishable by color alone.
+CHART_LINE_COLORS = [
+    "#2563eb", "#dc2626", "#059669", "#7c3aed", "#ea580c", "#0891b2",
+    "#db2777", "#65a30d", "#9333ea", "#0d9488", "#ca8a04", "#4f46e5", "#e11d48",
+]
 
 ALERT_THRESHOLD_PERCENT = os.environ.get("ALERT_THRESHOLD_PERCENT")
 ALERT_THRESHOLD_PERCENT = float(ALERT_THRESHOLD_PERCENT) if ALERT_THRESHOLD_PERCENT else None
@@ -515,6 +545,152 @@ def weekly_trend_rows():
     return rows or None
 
 
+# --- Rate charts (1 week / 1 month / 1 year) --------------------------------
+# Uses the same rate_history.csv as the weekly trend above, rendered as a line
+# chart instead of a text summary, for each of the three ranges in CHART_SPECS.
+
+def _read_history_rows():
+    """Parses rate_history.csv into [(timestamp, code, rate), ...], skipping
+    any malformed rows. Returns [] if the file doesn't exist yet (e.g. the
+    very first run)."""
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    rows = []
+    with open(HISTORY_FILE, encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            try:
+                ts = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M").replace(tzinfo=VN_TZ)
+                rate = float(row["rate"])
+            except (ValueError, KeyError):
+                continue
+            rows.append((ts, row["currency"], rate))
+    return rows
+
+
+def render_rate_chart(history_rows, days):
+    """Builds a % change line chart from pre-parsed history_rows (as returned
+    by _read_history_rows(), optionally with this run's not-yet-saved rates
+    appended), one line per CHART_CURRENCIES currency, over the trailing
+    `days` days.
+
+    Percent change is plotted relative to each currency's own first data
+    point inside the window, rather than the raw VND rate, because the
+    watchlist spans currencies on wildly different scales (JPY ~165 VND vs.
+    USD ~26,000 VND) that would be unreadable stacked on one raw axis —
+    normalizing to % change puts every currency on the same footing.
+
+    Returns (png_bytes, earliest_timestamp_plotted), or None if no currency
+    has at least 2 data points in the window (nothing usable to plot).
+    """
+    cutoff = now_vn() - timedelta(days=days)
+    by_code = {}
+    for ts, code, rate in history_rows:
+        if code not in CHART_CURRENCIES or ts < cutoff:
+            continue
+        by_code.setdefault(code, []).append((ts, rate))
+
+    series = {}
+    earliest = None
+    latest = None
+    for code, points in by_code.items():
+        points.sort(key=lambda p: p[0])
+        if len(points) < 2 or points[0][1] == 0:
+            continue
+        base = points[0][1]
+        series[code] = [(ts, (rate - base) / base * 100) for ts, rate in points]
+        earliest = points[0][0] if earliest is None else min(earliest, points[0][0])
+        latest = points[-1][0] if latest is None else max(latest, points[-1][0])
+
+    if not series:
+        return None
+
+    fig, ax = plt.subplots(figsize=(7.4, 4.0), dpi=180)
+    fig.patch.set_facecolor("#ffffff")  # fixed white background: the image can't
+    ax.set_facecolor("#ffffff")         # respond to the email's dark-mode CSS
+
+    for i, code in enumerate(c for c in WATCHLIST if c in series):
+        points = series[code]
+        ax.plot(
+            [p[0] for p in points], [p[1] for p in points],
+            label=code, color=CHART_LINE_COLORS[i % len(CHART_LINE_COLORS)],
+            linewidth=1.8, solid_capstyle="round",
+        )
+
+    ax.axhline(0, color="#c7ccd1", linewidth=0.8, linestyle="--", zorder=0)
+    ax.set_ylabel("Thay đổi so với đầu kỳ (%)", fontsize=9, color="#57606a")
+    ax.tick_params(labelsize=8, colors="#57606a")
+    ax.grid(axis="y", color="#eef0f2", linewidth=0.8)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    for spine in ("left", "bottom"):
+        ax.spines[spine].set_color("#e1e4e8")
+
+    # Formatted by the actual plotted span, not the nominal `days` window —
+    # early on, a project has far less history than a requested "1 year"
+    # range, and formatting by the nominal window would repeat the same
+    # coarse "MM/YYYY" label across every tick instead of showing real dates.
+    actual_span_days = (latest - earliest).total_seconds() / 86400
+    if actual_span_days <= 8:
+        date_fmt = "%d/%m %Hh"
+    elif actual_span_days <= 40:
+        date_fmt = "%d/%m"
+    else:
+        date_fmt = "%m/%Y"
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=8, tz=VN_TZ))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter(date_fmt, tz=VN_TZ))
+    fig.autofmt_xdate(rotation=30, ha="right")
+
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8, frameon=False, borderaxespad=0)
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor="#ffffff")
+    plt.close(fig)
+    return buf.getvalue(), earliest
+
+
+def generate_rate_charts(current_rates):
+    """Renders the 1-week / 1-month / 1-year charts to chart_1w.png etc. in
+    the working directory, so cmd_send() can attach them as inline images.
+
+    current_rates (this run's freshly fetched market rates) is folded in as
+    the latest point even though append_history() hasn't written it to
+    rate_history.csv yet at this point in cmd_generate() — otherwise the
+    chart would always lag one run (up to ~30 min) behind the rate table in
+    the same email. Nothing extra is written to the CSV here; the normal
+    append_history() call right after does that once, as before.
+
+    Returns one result dict per entry in CHART_SPECS, in order, either
+    {"key", "label", "days", "ok": True, "path", "coverage_days"} or
+    {"key", "label", "days", "ok": False} when there isn't enough history
+    yet for that range.
+    """
+    history_rows = _read_history_rows()
+    if current_rates:
+        ts = now_vn()
+        history_rows = history_rows + [(ts, code, rate) for code, rate in current_rates.items()]
+
+    results = []
+    for key, days, label in CHART_SPECS:
+        path = CHART_FILE_TEMPLATE.format(key)
+        if os.path.exists(path):
+            os.remove(path)  # avoid ever attaching a stale image from a previous run
+
+        rendered = render_rate_chart(history_rows, days)
+        if rendered is None:
+            results.append({"key": key, "label": label, "days": days, "ok": False})
+            continue
+
+        png_bytes, earliest = rendered
+        with open(path, "wb") as f:
+            f.write(png_bytes)
+        results.append({
+            "key": key, "label": label, "days": days, "ok": True, "path": path,
+            "coverage_days": (now_vn() - earliest).total_seconds() / 86400,
+        })
+    return results
+
+
 # --- Best-rate + discrepancy analysis ----------------------------------------
 
 def collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates):
@@ -682,7 +858,7 @@ def conversion_section(rates):
 
 def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
                        vcb_error=None, fawaz_error=None, fxrates_error=None, coingecko_error=None,
-                       market_error=None):
+                       market_error=None, chart_results=None):
     lines = [f"Tỷ giá quy đổi sang VND - {now_vn().strftime('%Y-%m-%d %H:%M')}\n"]
 
     summary = quick_summary_section(rates, previous_rates)
@@ -801,6 +977,10 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         lines.append("")
         lines += trend
 
+    if chart_results and any(r["ok"] for r in chart_results):
+        lines.append("")
+        lines.append("Biểu đồ tỷ giá (1 tuần / 1 tháng / 1 năm): xem trong email HTML.")
+
     lines.append("")
     lines.append("Nguồn dữ liệu:")
     for name, url in used_sources:
@@ -838,6 +1018,7 @@ SECTION_ACCENTS = {
     "coingecko": "#f59e0b",    # gold/amber (crypto-ish, distinct from discrepancy's amber)
     "conversions": "#4f46e5",  # indigo
     "trend": "#db2777",        # rose
+    "chart": "#a21caf",        # fuchsia
 }
 
 # Brightened versions of each accent, used ONLY for title/header text color in dark
@@ -857,6 +1038,7 @@ SECTION_ACCENTS_DARK = {
     "coingecko": "#f59e0b",     # already passes as-is, unchanged
     "conversions": "#847eed",
     "trend": "#e25292",
+    "chart": "#e879f9",
 }
 
 # Small color dot shown next to each currency code, roughly evoking each currency's
@@ -1050,7 +1232,7 @@ def _html_document(body_html):
 
 def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
                        vcb_error=None, fawaz_error=None, fxrates_error=None, coingecko_error=None,
-                       market_error=None):
+                       market_error=None, chart_results=None):
     C = _HTML_COLORS
     comparable = collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates)
     used_sources = []
@@ -1296,6 +1478,37 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
             accent=SECTION_ACCENTS["trend"], accent_key="trend",
         ))
 
+    # Rate charts (1 week / 1 month / 1 year)
+    if chart_results:
+        chart_accent = SECTION_ACCENTS["chart"]
+        blocks = []
+        for r in chart_results:
+            blocks.append(
+                f'<div style="font-size:13px;font-weight:700;color:{C["text"]};margin:14px 0 6px;">{_html_escape(r["label"])}</div>'
+            )
+            if r["ok"]:
+                blocks.append(
+                    f'<img src="cid:chart-{r["key"]}" width="600" alt="Biểu đồ tỷ giá {_html_escape(r["label"])}" '
+                    f'style="width:100%;max-width:600px;height:auto;display:block;border-radius:6px;border:1px solid {C["border"]};">'
+                )
+                if r["coverage_days"] < r["days"] - 1:
+                    blocks.append(
+                        f'<div class="crx-muted" style="font-size:11.5px;color:{C["muted"]};margin-top:4px;">'
+                        f'Mới có {r["coverage_days"]:.1f} ngày dữ liệu — biểu đồ sẽ đầy dần theo thời gian.</div>'
+                    )
+            else:
+                blocks.append(
+                    f'<div class="crx-muted" style="font-size:12.5px;color:{C["muted"]};">'
+                    f'Chưa đủ dữ liệu lịch sử cho khoảng {_html_escape(r["label"])} — sẽ hiển thị khi đã tích lũy đủ.</div>'
+                )
+        parts.append(_html_card(
+            "Biểu đồ tỷ giá theo thời gian", "".join(blocks),
+            f"Tính theo lịch sử {_html_escape(SOURCES[0][0])}, ghi lại mỗi lần chạy",
+            accent=chart_accent, accent_key="chart",
+            description="Phần trăm thay đổi so với đầu mỗi khoảng thời gian, theo từng loại tiền trong danh sách theo dõi "
+                         "(quy về cùng thang đo vì các loại tiền chênh lệch giá trị rất lớn).",
+        ))
+
     # Sources footer
     source_links = " &nbsp;&middot;&nbsp; ".join(
         f'<a href="{url}" style="color:{C["accent"]};text-decoration:none;">{_html_escape(name)}</a>'
@@ -1314,9 +1527,29 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
 
 def send_email(body, html_body=None, subject=None):
     if html_body:
-        msg = MIMEMultipart("alternative")
-        msg.attach(MIMEText(body, "plain", "utf-8"))
-        msg.attach(MIMEText(html_body, "html", "utf-8"))
+        alt = MIMEMultipart("alternative")
+        alt.attach(MIMEText(body, "plain", "utf-8"))
+        alt.attach(MIMEText(html_body, "html", "utf-8"))
+
+        # Any chart PNGs generate_rate_charts() left on disk this run get attached
+        # as inline images, matched to the <img src="cid:chart-1w"> etc. references
+        # already baked into html_body. Missing files (range had no chart this run)
+        # are simply skipped — the HTML only ever references charts that exist.
+        chart_paths = [
+            (key, CHART_FILE_TEMPLATE.format(key)) for key, _, _ in CHART_SPECS
+            if os.path.exists(CHART_FILE_TEMPLATE.format(key))
+        ]
+        if chart_paths:
+            msg = MIMEMultipart("related")
+            msg.attach(alt)
+            for key, path in chart_paths:
+                with open(path, "rb") as f:
+                    img = MIMEImage(f.read(), _subtype="png")
+                img.add_header("Content-ID", f"<chart-{key}>")
+                img.add_header("Content-Disposition", "inline", filename=os.path.basename(path))
+                msg.attach(img)
+        else:
+            msg = alt
     else:
         msg = MIMEText(body, "plain", "utf-8")
 
@@ -1460,10 +1693,16 @@ def cmd_generate():
         # No new data was fetched — don't overwrite the rate cache or history.
         return
 
+    # Rendered from rate_history.csv plus this run's not-yet-saved rates, so the
+    # charts stay in sync with the rate table below rather than lagging one run.
+    chart_results = generate_rate_charts(rates)
+
     body = format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
-                              vcb_error, fawaz_error, fxrates_error, coingecko_error, market_error)
+                              vcb_error, fawaz_error, fxrates_error, coingecko_error, market_error,
+                              chart_results=chart_results)
     html_body = format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
-                                   vcb_error, fawaz_error, fxrates_error, coingecko_error, market_error)
+                                   vcb_error, fawaz_error, fxrates_error, coingecko_error, market_error,
+                                   chart_results=chart_results)
     with open(EMAIL_BODY_FILE, "w", encoding="utf-8") as f:
         f.write(body)
     with open(EMAIL_HTML_FILE, "w", encoding="utf-8") as f:
