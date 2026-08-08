@@ -64,7 +64,6 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from email.mime.text import MIMEText
-from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 
 import requests
@@ -276,17 +275,33 @@ CHART_SPECS = [
 CHART_FILE_TEMPLATE = "chart_{}.png"  # -> chart_1w.png, chart_1m.png, chart_1y.png
 
 
-def _chart_cid(key):
-    """Content-ID (no angle brackets, no 'cid:' prefix) for a chart range key.
-    RFC 2392 defines a Content-ID as an addr-spec — local-part@domain, the
-    same shape as a Message-ID — not a bare token. A bare '<chart-1w>' is
-    what most tutorial snippets use and it's tolerated by several desktop
-    clients, but it's non-conformant, and Gmail's web client in particular
-    has been observed falling back to showing the image as a plain
-    attachment instead of resolving it inline when the id isn't in this
-    form. Used identically at HTML-build time (cid:<this>) and at
-    send time (Content-ID: <<this>>) so the two can't drift apart."""
-    return f"chart-{key}@currency-rate-emailer"
+# Where the committed chart PNGs are publicly reachable, so the email can
+# link to them by URL instead of attaching them. Gmail was observed showing
+# CID-attached inline images as plain attachments instead of resolving them
+# inline — even with an RFC-conformant Content-ID — so charts are now hosted
+# instead of attached; the "Publish charts" workflow step commits and pushes
+# chart_*.png before the email is sent, so the URL below is already live by
+# the time it's referenced.
+# GITHUB_REPOSITORY and GITHUB_REF_NAME are set automatically by GitHub
+# Actions on every run; CHART_BASE_URL overrides both, for local testing or
+# hosting the PNGs somewhere else.
+_chart_base_url_env = os.environ.get("CHART_BASE_URL")
+if _chart_base_url_env:
+    CHART_BASE_URL = _chart_base_url_env.rstrip("/")
+else:
+    _gh_repo = os.environ.get("GITHUB_REPOSITORY")
+    _gh_branch = os.environ.get("GITHUB_REF_NAME", "main")
+    CHART_BASE_URL = f"https://raw.githubusercontent.com/{_gh_repo}/{_gh_branch}" if _gh_repo else None
+
+
+def _chart_image_url(key, cache_bust):
+    """Public URL for a chart PNG, with a cache-busting query param — the
+    filename is the same every run (chart_1w.png etc.) but the content
+    changes, and both raw.githubusercontent.com and Gmail's own image proxy
+    cache by URL, so without this an old chart could keep showing well
+    after a fresher one was published."""
+    return f"{CHART_BASE_URL}/{CHART_FILE_TEMPLATE.format(key)}?t={cache_bust}"
+
 
 # Which currencies to plot. Defaults to the full watchlist; can be narrowed
 # (e.g. "USD,EUR") if 13 panels feels like too many.
@@ -1521,14 +1536,15 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
     # Rate charts (1 week / 1 month / 1 year)
     if chart_results:
         chart_accent = SECTION_ACCENTS["chart"]
+        cache_bust = int(now_vn().timestamp())
         blocks = []
         for r in chart_results:
             blocks.append(
                 f'<div style="font-size:13px;font-weight:700;color:{C["text"]};margin:14px 0 6px;">{_html_escape(r["label"])}</div>'
             )
-            if r["ok"]:
+            if r["ok"] and CHART_BASE_URL:
                 blocks.append(
-                    f'<img src="cid:{_chart_cid(r["key"])}" width="600" alt="Biểu đồ tỷ giá {_html_escape(r["label"])}" '
+                    f'<img src="{_chart_image_url(r["key"], cache_bust)}" width="600" alt="Biểu đồ tỷ giá {_html_escape(r["label"])}" '
                     f'style="width:100%;max-width:600px;height:auto;display:block;border-radius:6px;border:1px solid {C["border"]};">'
                 )
                 if r["coverage_days"] < r["days"] - 1:
@@ -1536,6 +1552,13 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
                         f'<div class="crx-muted" style="font-size:11.5px;color:{C["muted"]};margin-top:4px;">'
                         f'Mới có {r["coverage_days"]:.1f} ngày dữ liệu — biểu đồ sẽ đầy dần theo thời gian.</div>'
                     )
+            elif r["ok"]:
+                # Chart was rendered but there's nowhere public to host it from (e.g.
+                # running outside GitHub Actions with no CHART_BASE_URL override).
+                blocks.append(
+                    f'<div class="crx-muted" style="font-size:12.5px;color:{C["muted"]};">'
+                    f'Đã tạo biểu đồ nhưng chưa có URL công khai để hiển thị (thiếu CHART_BASE_URL / GITHUB_REPOSITORY).</div>'
+                )
             else:
                 blocks.append(
                     f'<div class="crx-muted" style="font-size:12.5px;color:{C["muted"]};">'
@@ -1567,29 +1590,9 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
 
 def send_email(body, html_body=None, subject=None):
     if html_body:
-        alt = MIMEMultipart("alternative")
-        alt.attach(MIMEText(body, "plain", "utf-8"))
-        alt.attach(MIMEText(html_body, "html", "utf-8"))
-
-        # Any chart PNGs generate_rate_charts() left on disk this run get attached
-        # as inline images, matched to the <img src="cid:chart-1w@..."> etc. references
-        # already baked into html_body. Missing files (range had no chart this run)
-        # are simply skipped — the HTML only ever references charts that exist.
-        chart_paths = [
-            (key, CHART_FILE_TEMPLATE.format(key)) for key, _, _ in CHART_SPECS
-            if os.path.exists(CHART_FILE_TEMPLATE.format(key))
-        ]
-        if chart_paths:
-            msg = MIMEMultipart("related")
-            msg.attach(alt)
-            for key, path in chart_paths:
-                with open(path, "rb") as f:
-                    img = MIMEImage(f.read(), _subtype="png", name=os.path.basename(path))
-                img.add_header("Content-ID", f"<{_chart_cid(key)}>")
-                img.add_header("Content-Disposition", "inline", filename=os.path.basename(path))
-                msg.attach(img)
-        else:
-            msg = alt
+        msg = MIMEMultipart("alternative")
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
     else:
         msg = MIMEText(body, "plain", "utf-8")
 
