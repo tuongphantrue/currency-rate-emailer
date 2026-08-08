@@ -644,10 +644,30 @@ def render_rate_chart(history_rows, days):
         code = plotted_codes[idx]
         points = series[code]
         color = CURRENCY_DOT_COLORS.get(code, "#2563eb")
+        vals = [p[1] for p in points]
         ax.plot(
-            [p[0] for p in points], [p[1] for p in points],
+            [p[0] for p in points], vals,
             color=color, linewidth=1.6, solid_capstyle="round",
         )
+
+        # Email images can't respond to a hover, so the values someone would
+        # want from pointing at the line are placed on the chart instead:
+        # the latest point is marked and labeled, and low/high for the
+        # window are printed underneath.
+        last_ts, last_val = points[-1]
+        ax.plot([last_ts], [last_val], marker="o", markersize=3.5, color=color, zorder=5)
+        ax.text(
+            0.97, 0.94, f"{last_val:,.2f}", transform=ax.transAxes,
+            fontsize=7.5, fontweight="bold", color=color, ha="right", va="top",
+        )
+        lo, hi = min(vals), max(vals)
+        if hi > lo:
+            ax.text(
+                0.97, 0.06, f"{lo:,.2f}\u2013{hi:,.2f}", transform=ax.transAxes,
+                fontsize=6.5, color="#57606a", ha="right", va="bottom",
+            )
+        ax.margins(y=0.28)  # headroom so the corner label never overlaps the line
+
         ax.set_title(code, fontsize=10, fontweight="bold", color="#1f2328", loc="left", pad=3)
         ax.tick_params(labelsize=7, colors="#57606a")
         ax.grid(axis="y", color="#eef0f2", linewidth=0.7)
