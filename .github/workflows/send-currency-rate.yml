@@ -29,27 +29,35 @@ jobs:
           ALERT_THRESHOLD_PERCENT: ""   # set e.g. "1.5" to only email on big moves
         run: python currency_rate_emailer.py generate
 
-      - name: Publish charts
-        # Charts are linked into the email by URL (raw.githubusercontent.com)
-        # rather than attached, so they need to be pushed before the email
-        # goes out. Guarded so a run with no chart files yet (e.g. brand-new
-        # fork, no history) doesn't fail the job.
+      - name: Commit rate data and charts
+        # Everything `generate` touched — last_rates.json, rate_history.csv,
+        # and chart_*.png — is committed together, in one step, before the
+        # email is sent. Charts are linked into the email by URL rather than
+        # attached, so the URL needs to already be live by send time.
+        #
+        # This has to be ONE commit covering all of it, not split into
+        # "charts before send" / "rate data after send": generate() modifies
+        # last_rates.json and rate_history.csv too, and if a separate,
+        # earlier step committed only the charts, those two files would be
+        # left as uncommitted changes in the working tree — which is exactly
+        # what made `git pull --rebase` refuse to run ("You have unstaged
+        # changes") in the previous version of this step.
+        #
+        # continue-on-error so a git hiccup here (e.g. a rebase conflict)
+        # can't prevent the email itself from sending — worst case, that
+        # run's chart links go stale until the next successful run.
+        continue-on-error: true
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
           shopt -s nullglob
-          charts=(chart_*.png)
-          if [ ${#charts[@]} -eq 0 ]; then
-            echo "No chart images generated this run."
+          git add last_rates.json rate_history.csv chart_*.png
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
           else
-            git add "${charts[@]}"
-            if git diff --cached --quiet; then
-              echo "No chart changes to commit."
-            else
-              git commit -m "Update rate charts [skip ci]"
-              git pull --rebase origin main
-              git push origin main
-            fi
+            git commit -m "Update rate cache, history, and charts [skip ci]"
+            git pull --rebase origin main
+            git push origin main
           fi
 
       - name: Send email
@@ -58,16 +66,3 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           CURRENCY_RECIPIENT: ${{ secrets.CURRENCY_RECIPIENT }}
         run: python currency_rate_emailer.py send
-
-      - name: Commit updated rate cache and history
-        run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-          git add last_rates.json rate_history.csv
-          if git diff --cached --quiet; then
-            echo "No state changes to commit."
-          else
-            git commit -m "Update rate cache and history [skip ci]"
-            git pull --rebase origin main
-            git push origin main
-          fi
