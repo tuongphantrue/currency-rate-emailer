@@ -56,6 +56,7 @@ import os
 import re
 import sys
 import csv
+import io
 import json
 import time
 import smtplib
@@ -66,6 +67,11 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 import requests
+import matplotlib
+matplotlib.use("Agg")  # no display on GitHub Actions runners / most servers
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.ticker import MaxNLocator
 
 # --- Config -------------------------------------------------------------
 
@@ -260,6 +266,50 @@ EMAIL_SUBJECT_FILE = "email_subject.txt"
 STATE_FILE = "last_rates.json"
 HISTORY_FILE = "rate_history.csv"
 
+# (range key, trailing days, Vietnamese label) for the three rate charts.
+CHART_SPECS = [
+    ("1w", 7, "1 tuần"),
+    ("1m", 30, "1 tháng"),
+    ("1y", 365, "1 năm"),
+]
+CHART_FILE_TEMPLATE = "chart_{}.png"  # -> chart_1w.png, chart_1m.png, chart_1y.png
+
+
+# Where the committed chart PNGs are publicly reachable, so the email can
+# link to them by URL instead of attaching them. Gmail was observed showing
+# CID-attached inline images as plain attachments instead of resolving them
+# inline — even with an RFC-conformant Content-ID — so charts are now hosted
+# instead of attached; the "Publish charts" workflow step commits and pushes
+# chart_*.png before the email is sent, so the URL below is already live by
+# the time it's referenced.
+# GITHUB_REPOSITORY and GITHUB_REF_NAME are set automatically by GitHub
+# Actions on every run; CHART_BASE_URL overrides both, for local testing or
+# hosting the PNGs somewhere else.
+_chart_base_url_env = os.environ.get("CHART_BASE_URL")
+if _chart_base_url_env:
+    CHART_BASE_URL = _chart_base_url_env.rstrip("/")
+else:
+    _gh_repo = os.environ.get("GITHUB_REPOSITORY")
+    _gh_branch = os.environ.get("GITHUB_REF_NAME", "main")
+    CHART_BASE_URL = f"https://raw.githubusercontent.com/{_gh_repo}/{_gh_branch}" if _gh_repo else None
+
+
+def _chart_image_url(key, cache_bust):
+    """Public URL for a chart PNG, with a cache-busting query param — the
+    filename is the same every run (chart_1w.png etc.) but the content
+    changes, and both raw.githubusercontent.com and Gmail's own image proxy
+    cache by URL, so without this an old chart could keep showing well
+    after a fresher one was published."""
+    return f"{CHART_BASE_URL}/{CHART_FILE_TEMPLATE.format(key)}?t={cache_bust}"
+
+
+# Which currencies to plot. Defaults to the full watchlist; can be narrowed
+# (e.g. "USD,EUR") if 13 panels feels like too many.
+_chart_currencies_env = os.environ.get("CHART_CURRENCIES")
+CHART_CURRENCIES = (
+    [c.strip() for c in _chart_currencies_env.split(",")] if _chart_currencies_env else list(WATCHLIST)
+)
+
 ALERT_THRESHOLD_PERCENT = os.environ.get("ALERT_THRESHOLD_PERCENT")
 ALERT_THRESHOLD_PERCENT = float(ALERT_THRESHOLD_PERCENT) if ALERT_THRESHOLD_PERCENT else None
 
@@ -416,7 +466,7 @@ def load_previous_rates():
     if not os.path.exists(STATE_FILE):
         return None
     try:
-        with open(STATE_FILE) as f:
+        with open(STATE_FILE, encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) and data else None
     except (json.JSONDecodeError, ValueError, OSError) as e:
@@ -425,7 +475,7 @@ def load_previous_rates():
 
 
 def save_rates(rates):
-    with open(STATE_FILE, "w") as f:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(rates, f)
 
 
@@ -445,7 +495,7 @@ def should_send(rates, previous_rates):
 def append_history(rates):
     """Appends this run's market rates to a CSV: timestamp,currency,rate"""
     is_new_file = not os.path.exists(HISTORY_FILE)
-    with open(HISTORY_FILE, "a", newline="") as f:
+    with open(HISTORY_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         if is_new_file:
             writer.writerow(["timestamp", "currency", "rate"])
@@ -479,7 +529,7 @@ def weekly_trend_rows():
     oldest_near_cutoff = {}  # currency -> (timestamp, rate) closest to 7 days ago
     latest = {}  # currency -> (timestamp, rate) most recent
 
-    with open(HISTORY_FILE) as f:
+    with open(HISTORY_FILE, encoding="utf-8") as f:
         for row in csv.DictReader(f):
             try:
                 ts = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M").replace(tzinfo=VN_TZ)
@@ -494,16 +544,206 @@ def weekly_trend_rows():
             if ts <= cutoff and (code not in oldest_near_cutoff or ts > oldest_near_cutoff[code][0]):
                 oldest_near_cutoff[code] = (ts, rate)
 
+    # The workflow runs twice during the Monday 00:xx window. Once a row from
+    # this week's slot is already present, the first run has produced the
+    # weekly summary and appended its history, so later runs should not repeat
+    # the same section.
+    if any(ts.date() == vn_now.date() and ts.hour == 0 for ts, _ in latest.values()):
+        return None
+
     rows = []
     for code in WATCHLIST:
         if code in latest and code in oldest_near_cutoff:
             _, old_rate = oldest_near_cutoff[code]
             _, new_rate = latest[code]
+            if old_rate == 0:
+                continue
             pct = (new_rate - old_rate) / old_rate * 100
             arrow = "TĂNG" if pct > 0 else ("GIẢM" if pct < 0 else "KHÔNG ĐỔI")
             rows.append({"code": code, "pct": pct, "arrow": arrow})
 
     return rows or None
+
+
+# --- Rate charts (1 week / 1 month / 1 year) --------------------------------
+# Uses the same rate_history.csv as the weekly trend above, rendered as a line
+# chart instead of a text summary, for each of the three ranges in CHART_SPECS.
+
+def _read_history_rows():
+    """Parses rate_history.csv into [(timestamp, code, rate), ...], skipping
+    any malformed rows. Returns [] if the file doesn't exist yet (e.g. the
+    very first run)."""
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    rows = []
+    with open(HISTORY_FILE, encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            try:
+                ts = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M").replace(tzinfo=VN_TZ)
+                rate = float(row["rate"])
+            except (ValueError, KeyError):
+                continue
+            rows.append((ts, row["currency"], rate))
+    return rows
+
+
+def render_rate_chart(history_rows, days):
+    """Builds a grid of small per-currency charts — one panel per
+    CHART_CURRENCIES currency, each showing that currency's own raw VND
+    rate as a line — over the trailing `days` days.
+
+    Earlier this plotted all currencies as % change overlaid on one shared
+    axis, but with the full watchlist (13 currencies) that made individual
+    lines impossible to tell apart even with distinct colors. Splitting
+    into one small panel per currency, each with its own independent
+    y-axis, means every currency gets legible room regardless of how much
+    (or little) it moved relative to the others — and each panel can reuse
+    that currency's CURRENCY_DOT_COLORS accent for visual consistency with
+    the rest of the email, since panels no longer compete for distinguishable
+    colors the way overlaid lines did.
+
+    Returns (png_bytes, earliest_timestamp_plotted), or None if no currency
+    has at least 2 data points in the window (nothing usable to plot).
+    """
+    cutoff = now_vn() - timedelta(days=days)
+    by_code = {}
+    for ts, code, rate in history_rows:
+        if code not in CHART_CURRENCIES or ts < cutoff:
+            continue
+        by_code.setdefault(code, []).append((ts, rate))
+
+    series = {}
+    earliest = None
+    latest = None
+    for code, points in by_code.items():
+        points.sort(key=lambda p: p[0])
+        if len(points) < 2:
+            continue
+        series[code] = points
+        earliest = points[0][0] if earliest is None else min(earliest, points[0][0])
+        latest = points[-1][0] if latest is None else max(latest, points[-1][0])
+
+    if not series:
+        return None
+
+    plotted_codes = [c for c in WATCHLIST if c in series]
+    n = len(plotted_codes)
+    cols = min(3, n)
+    rows = (n + cols - 1) // cols  # ceil division
+
+    fig, axes = plt.subplots(
+        rows, cols, figsize=(3.05 * cols, 2.15 * rows), dpi=170,
+        sharex=True, squeeze=False,
+    )
+    fig.patch.set_facecolor("#ffffff")  # fixed white background: the image can't
+                                         # respond to the email's dark-mode CSS
+
+    # Formatted by the actual plotted span, not the nominal `days` window —
+    # early on, a project has far less history than a requested "1 year"
+    # range, and formatting by the nominal window would repeat the same
+    # coarse "MM/YYYY" label across every tick instead of showing real dates.
+    actual_span_days = (latest - earliest).total_seconds() / 86400
+    if actual_span_days <= 8:
+        date_fmt = "%d/%m %Hh"
+    elif actual_span_days <= 40:
+        date_fmt = "%d/%m"
+    else:
+        date_fmt = "%m/%Y"
+
+    for idx, ax in enumerate(axes.flat):
+        ax.set_facecolor("#ffffff")
+        if idx >= n:
+            ax.axis("off")  # unused grid cell when n doesn't fill the last row
+            continue
+
+        code = plotted_codes[idx]
+        points = series[code]
+        color = CURRENCY_DOT_COLORS.get(code, "#2563eb")
+        vals = [p[1] for p in points]
+        ax.plot(
+            [p[0] for p in points], vals,
+            color=color, linewidth=1.6, solid_capstyle="round",
+        )
+
+        # Email images can't respond to a hover, so the values someone would
+        # want from pointing at the line are placed on the chart instead:
+        # the latest point is marked and labeled, and low/high for the
+        # window are printed underneath.
+        last_ts, last_val = points[-1]
+        ax.plot([last_ts], [last_val], marker="o", markersize=3.5, color=color, zorder=5)
+        ax.text(
+            0.97, 0.94, f"{last_val:,.2f}", transform=ax.transAxes,
+            fontsize=7.5, fontweight="bold", color=color, ha="right", va="top",
+        )
+        lo, hi = min(vals), max(vals)
+        if hi > lo:
+            ax.text(
+                0.97, 0.06, f"{lo:,.2f}\u2013{hi:,.2f}", transform=ax.transAxes,
+                fontsize=6.5, color="#57606a", ha="right", va="bottom",
+            )
+        ax.margins(y=0.28)  # headroom so the corner label never overlaps the line
+
+        ax.set_title(code, fontsize=10, fontweight="bold", color="#1f2328", loc="left", pad=3)
+        ax.tick_params(labelsize=7, colors="#57606a")
+        ax.grid(axis="y", color="#eef0f2", linewidth=0.7)
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+        for spine in ("left", "bottom"):
+            ax.spines[spine].set_color("#e1e4e8")
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=2, maxticks=4, tz=VN_TZ))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter(date_fmt, tz=VN_TZ))
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=4))
+        ax.label_outer()  # tick labels only on the outer edge of the grid
+
+    fig.autofmt_xdate(rotation=30, ha="right")
+    fig.tight_layout(h_pad=1.4, w_pad=1.2)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor="#ffffff")
+    plt.close(fig)
+    return buf.getvalue(), earliest
+
+
+def generate_rate_charts(current_rates):
+    """Renders the 1-week / 1-month / 1-year charts to chart_1w.png etc. in
+    the working directory, so cmd_send() can attach them as inline images.
+
+    current_rates (this run's freshly fetched market rates) is folded in as
+    the latest point even though append_history() hasn't written it to
+    rate_history.csv yet at this point in cmd_generate() — otherwise the
+    chart would always lag one run (up to ~30 min) behind the rate table in
+    the same email. Nothing extra is written to the CSV here; the normal
+    append_history() call right after does that once, as before.
+
+    Returns one result dict per entry in CHART_SPECS, in order, either
+    {"key", "label", "days", "ok": True, "path", "coverage_days"} or
+    {"key", "label", "days", "ok": False} when there isn't enough history
+    yet for that range.
+    """
+    history_rows = _read_history_rows()
+    if current_rates:
+        ts = now_vn()
+        history_rows = history_rows + [(ts, code, rate) for code, rate in current_rates.items()]
+
+    results = []
+    for key, days, label in CHART_SPECS:
+        path = CHART_FILE_TEMPLATE.format(key)
+        if os.path.exists(path):
+            os.remove(path)  # avoid ever attaching a stale image from a previous run
+
+        rendered = render_rate_chart(history_rows, days)
+        if rendered is None:
+            results.append({"key": key, "label": label, "days": days, "ok": False})
+            continue
+
+        png_bytes, earliest = rendered
+        with open(path, "wb") as f:
+            f.write(png_bytes)
+        results.append({
+            "key": key, "label": label, "days": days, "ok": True, "path": path,
+            "coverage_days": (now_vn() - earliest).total_seconds() / 86400,
+        })
+    return results
 
 
 # --- Best-rate + discrepancy analysis ----------------------------------------
@@ -518,8 +758,16 @@ def collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates, coing
         comparable[code][SOURCES[0][0]] = rate
 
     for code, vals in vcb_rates.items():
-        avg = (vals["buy"] + vals["sell"]) / 2
-        comparable[code][SOURCES[1][0]] = avg
+        # Some currencies occasionally omit either the buy or sell quote. The
+        # parser represents a missing side as 0.0; averaging that zero with the
+        # valid side would create a fictitious half-price rate and trigger false
+        # best-rate/discrepancy alerts. Average only the quotes that exist.
+        available_quotes = [
+            value for value in (vals.get("buy"), vals.get("sell"))
+            if isinstance(value, (int, float)) and value > 0
+        ]
+        if available_quotes:
+            comparable[code][SOURCES[1][0]] = sum(available_quotes) / len(available_quotes)
 
     for code, rate in fawaz_rates.items():
         comparable[code][SOURCES[2][0]] = rate
@@ -665,7 +913,7 @@ def conversion_section(rates):
 
 def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
                        vcb_error=None, fawaz_error=None, fxrates_error=None, coingecko_error=None,
-                       market_error=None):
+                       market_error=None, chart_results=None):
     lines = [f"Tỷ giá quy đổi sang VND - {now_vn().strftime('%Y-%m-%d %H:%M')}\n"]
 
     summary = quick_summary_section(rates, previous_rates)
@@ -784,6 +1032,10 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         lines.append("")
         lines += trend
 
+    if chart_results and any(r["ok"] for r in chart_results):
+        lines.append("")
+        lines.append("Biểu đồ tỷ giá (1 tuần / 1 tháng / 1 năm): xem trong email HTML.")
+
     lines.append("")
     lines.append("Nguồn dữ liệu:")
     for name, url in used_sources:
@@ -796,34 +1048,32 @@ def format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
 
 # Color palette kept intentionally small: one accent per direction, neutral grays for structure.
 _HTML_COLORS = {
-    "up": "#15803d",
-    "down": "#dc2626",
-    "flat": "#6b7280",
-    "border": "#e5e7eb",
-    "muted": "#6b7280",
-    "card_bg": "#ffffff",
-    "warn_bg": "#fef3c7",
-    "warn_border": "#b45309",
-    "text": "#111827",
-    "accent": "#2563eb",
-    "page_bg": "#f6f7f9",
+    "up": "#1a7f37",
+    "down": "#cf222e",
+    "flat": "#57606a",
+    "border": "#e1e4e8",
+    "muted": "#57606a",
+    "card_bg": "#f6f8fa",
+    "warn_bg": "#fff8e5",
+    "warn_border": "#f2c744",
+    "text": "#1f2328",
+    "accent": "#0969da",
 }
 
 # One accent color per section, used for the card's left border, title, and a tinted
-# table-header background. Rebuilt to match rework.com's real product UI (verified
-# from actual screenshots, not the marketing site): white cards, a single primary
-# blue, and small colorful pastel badge tags — not a dark theme.
+# table-header background. Vietcombank uses their actual brand green as a deliberate touch.
 SECTION_ACCENTS = {
-    "best": "#2563eb",
-    "discrepancy": "#b45309",    # amber kept — this is a functional warning signal, not decoration
-    "compare": "#2563eb",
-    "market": "#2563eb",
-    "vcb": "#2563eb",
-    "fawaz": "#2563eb",
-    "fxrates": "#2563eb",
-    "coingecko": "#2563eb",
-    "conversions": "#2563eb",
-    "trend": "#2563eb",
+    "best": "#0d9488",         # teal
+    "discrepancy": "#d97706",  # amber (paired with the warn background)
+    "compare": "#0e7490",      # cyan — the full side-by-side comparison table
+    "market": "#2563eb",       # blue
+    "vcb": "#475569",          # neutral slate — no longer matches VCB's own brand green
+    "fawaz": "#7c3aed",        # purple
+    "fxrates": "#ea580c",      # orange
+    "coingecko": "#f59e0b",    # gold/amber (crypto-ish, distinct from discrepancy's amber)
+    "conversions": "#4f46e5",  # indigo
+    "trend": "#db2777",        # rose
+    "chart": "#a21caf",        # fuchsia
 }
 
 # Brightened versions of each accent, used ONLY for title/header text color in dark
@@ -832,14 +1082,35 @@ SECTION_ACCENTS = {
 # (4.5:1) as text on a dark card background, verified by computing actual contrast
 # ratios — not just eyeballed. These are the minimum white-blend needed per accent to
 # clear 4.5:1 against the #1e1e1e dark card background used below.
+SECTION_ACCENTS_DARK = {
+    "best": "#19998e",
+    "discrepancy": "#d97706",   # already passes as-is, unchanged
+    "compare": "#3e90a6",
+    "market": "#5182ef",
+    "vcb": "#7e8896",
+    "fawaz": "#9d6bf2",
+    "fxrates": "#ea580c",       # already passes as-is, unchanged
+    "coingecko": "#f59e0b",     # already passes as-is, unchanged
+    "conversions": "#847eed",
+    "trend": "#e25292",
+    "chart": "#e879f9",
+}
+
 # Small color dot shown next to each currency code, roughly evoking each currency's
 # home flag/brand without reproducing any actual flag imagery.
+CURRENCY_DOT_COLORS = {
+    "USD": "#2563eb", "EUR": "#7c3aed", "JPY": "#dc2626", "CNY": "#dc2626",
+    "KRW": "#2563eb", "GBP": "#1e3a8a", "SGD": "#dc2626", "AUD": "#059669",
+    "VND": "#dc2626", "CAD": "#dc2626", "CHF": "#dc2626", "HKD": "#dc2626",
+    "NZD": "#1e3a8a", "THB": "#7c3aed", "INR": "#ea580c", "IDR": "#dc2626",
+    "MYR": "#2563eb", "PHP": "#2563eb", "RUB": "#1e3a8a", "TWD": "#dc2626",
+    "TRY": "#dc2626", "ZAR": "#059669", "BRL": "#059669", "MXN": "#059669",
+    "AED": "#059669",
+}
+
 
 def _accent_of(code):
-    # Previously varied by currency (evoking flag colors); simplified to one
-    # neutral gray dot for a restrained, non-"rainbow" look, matching the
-    # single-accent design direction used throughout the rest of the email.
-    return "#6b7280"
+    return CURRENCY_DOT_COLORS.get(code, "#57606a")
 
 
 def _tint(hex_color, amount=0.88):
@@ -850,19 +1121,6 @@ def _tint(hex_color, amount=0.88):
     r = round(r + (255 - r) * amount)
     g = round(g + (255 - g) * amount)
     b = round(b + (255 - b) * amount)
-    return f"#{r:02x}{g:02x}{b:02x}"
-
-
-def _shade(hex_color, amount=0.88):
-    """Darkens a hex color by blending it toward black. amount=0.88 means
-    88% black / 12% original color — the dark-theme counterpart to _tint(),
-    used for subtle tinted backgrounds (e.g. table headers, summary block)
-    that need to stay dark rather than going pale/white."""
-    hex_color = hex_color.lstrip("#")
-    r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
-    r = round(r * (1 - amount))
-    g = round(g * (1 - amount))
-    b = round(b * (1 - amount))
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
@@ -893,43 +1151,31 @@ def _html_change_span(pct):
     )
 
 
-def _html_source_table(rows, headers, accent=None, accent_key=None, scroll_min_width=None):
+def _html_source_table(rows, headers, accent=None, accent_key=None):
     """rows: list of tuples matching headers. Renders a simple bordered table.
     accent, if given, tints the header row background and text with that color.
-    accent_key is accepted for backward compatibility with call sites but is
-    currently unused (previously fed a dark-mode-only color-brightening class,
-    now removed since the design commits to one dark palette, not two).
-    scroll_min_width, if given (e.g. "480px"), wraps the table in a horizontally
-    scrollable container instead of letting it squeeze to fit — for wide tables
-    (many columns) this keeps every column readable on a narrow phone screen,
-    at the cost of needing a horizontal swipe to see columns off-screen, rather
-    than the alternative (the client force-shrinking every column to illegible
-    widths and wrapping text mid-word, which looks broken).
-    """
+    accent_key, if given, adds a class so dark mode can brighten the header text
+    color independently (see SECTION_ACCENTS_DARK)."""
     header_bg = _tint(accent, 0.90) if accent else "transparent"
     header_color = accent if accent else _HTML_COLORS["muted"]
     header_class = f"crx-accent-{accent_key}" if accent_key else ""
     th = "".join(
         f'<th class="crx-thead {header_class}" style="text-align:left;padding:6px 10px;border-bottom:2px solid {_HTML_COLORS["border"]};'
         f'background:{header_bg};font-size:12px;color:{header_color};font-weight:700;'
-        f'text-transform:uppercase;letter-spacing:.03em;white-space:nowrap;">{h}</th>'
+        f'text-transform:uppercase;letter-spacing:.03em;">{h}</th>'
         for h in headers
     )
     body_rows = ""
     for row in rows:
         cells = "".join(
-            f'<td class="crx-td" style="padding:6px 10px;border-bottom:1px solid {_HTML_COLORS["border"]};font-size:14px;white-space:nowrap;">{cell}</td>'
+            f'<td class="crx-td" style="padding:6px 10px;border-bottom:1px solid {_HTML_COLORS["border"]};font-size:14px;">{cell}</td>'
             for cell in row
         )
         body_rows += f"<tr>{cells}</tr>"
-    table_width_style = f"min-width:{scroll_min_width};" if scroll_min_width else "width:100%;"
-    table_html = (
-        f'<table style="border-collapse:collapse;{table_width_style}margin:8px 0 20px;">'
+    return (
+        f'<table style="border-collapse:collapse;width:100%;margin:8px 0 20px;">'
         f"<thead><tr>{th}</tr></thead><tbody>{body_rows}</tbody></table>"
     )
-    if scroll_min_width:
-        return f'<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">{table_html}</div>'
-    return table_html
 
 
 def _html_card(title_html, inner_html, source_html, accent=None, accent_key=None, bg=None, border=None, description=None):
@@ -938,9 +1184,9 @@ def _html_card(title_html, inner_html, source_html, accent=None, accent_key=None
     description, if given, is a normal-case sentence shown below the source
     line explaining what the source actually is.
     accent, if given, colors the left border, title, and a small dot marker.
-    accent_key is accepted for backward compatibility with call sites but is
-    currently unused (previously fed a dark-mode-only color-brightening class,
-    now removed since the design commits to one dark palette, not two).
+    accent_key, if given, adds a class so dark mode can brighten the title
+    text color independently (see SECTION_ACCENTS_DARK) without touching the
+    left border, which stays the same accent color in both modes.
 
     NOTE: cards are plain (not collapsible) — Gmail's webmail CSS engine does
     not support :checked, :target, or any pseudo-class capable of holding a
@@ -950,7 +1196,7 @@ def _html_card(title_html, inner_html, source_html, accent=None, accent_key=None
     the glanceable-summary approach used instead.
     """
     is_warn = bg is not None  # only the discrepancy-alert card passes a custom bg today
-    bg = bg or _HTML_COLORS["card_bg"]
+    bg = bg or "#ffffff"
     border = border or _HTML_COLORS["border"]
     card_class = "crx-card-warn" if is_warn else "crx-card"
     title_class = f"crx-accent-{accent_key}" if accent_key else ""
@@ -984,25 +1230,64 @@ def _html_source_label(name, url):
     return f"Nguồn: {_html_escape(name)}"
 
 
+# Dark-mode support for Gmail/Outlook/Apple Mail. Inline styles normally win
+# over stylesheets, so this uses `!important` in a <head><style> block to
+# override them specifically inside a `prefers-color-scheme: dark` query —
+# the standard technique for HTML email dark mode. Only border-top/-right/
+# -bottom are touched (never border-left), so each card's colored left accent
+# stripe stays the same vivid color in both light and dark mode.
+_DARK_MODE_STYLE_BLOCK = """
+    @media (prefers-color-scheme: dark) {
+      .crx-summary {
+        background: #16211f !important;
+        color: #e8e8e8 !important;
+      }
+      .crx-card {
+        background: #1e1e1e !important;
+        border-top-color: #3a3a3a !important;
+        border-right-color: #3a3a3a !important;
+        border-bottom-color: #3a3a3a !important;
+        color: #e8e8e8 !important;
+      }
+      .crx-card-warn {
+        background: #332b12 !important;
+        border-top-color: #6b5615 !important;
+        border-right-color: #6b5615 !important;
+        border-bottom-color: #6b5615 !important;
+        color: #e8e8e8 !important;
+      }
+      .crx-muted { color: #9aa1a9 !important; }
+      .crx-footer { border-top-color: #3a3a3a !important; }
+      .crx-thead {
+        background: rgba(255,255,255,0.06) !important;
+        border-bottom-color: #3a3a3a !important;
+      }
+      .crx-td { border-bottom-color: #3a3a3a !important; }
+""" + "".join(
+    f'      .crx-accent-{key} {{ color: {dark_hex} !important; }}\n'
+    for key, dark_hex in SECTION_ACCENTS_DARK.items()
+) + """    }
+"""
+
+
 def _html_document(body_html):
-    """Wraps a body fragment in a full HTML document with the meta tags email
-    clients use to decide whether to auto-invert colors. This design commits
-    to one light look for everyone (matching the real rework.com product UI),
-    so color-scheme is declared as "light" — this tells clients the email is
-    intentionally light, discouraging any automatic dark-mode re-coloring.
+    """Wraps a body fragment in a full HTML document with the meta tags and
+    <style> block email clients need to apply real dark-mode support instead
+    of their own automatic (often ugly) light-to-dark inversion heuristics.
     """
     return (
         "<!DOCTYPE html>"
         '<html><head><meta charset="utf-8">'
-        '<meta name="color-scheme" content="light">'
-        '<meta name="supported-color-schemes" content="light">'
-        f"</head><body style=\"margin:0;padding:0;background:{_HTML_COLORS['page_bg']};\">{body_html}</body></html>"
+        '<meta name="color-scheme" content="light dark">'
+        '<meta name="supported-color-schemes" content="light dark">'
+        f"<style>{_DARK_MODE_STYLE_BLOCK}</style>"
+        f"</head><body style=\"margin:0;padding:0;\">{body_html}</body></html>"
     )
 
 
 def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
                        vcb_error=None, fawaz_error=None, fxrates_error=None, coingecko_error=None,
-                       market_error=None):
+                       market_error=None, chart_results=None):
     C = _HTML_COLORS
     comparable = collect_comparable_rates(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates)
     used_sources = []
@@ -1010,13 +1295,13 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
     parts = []
     parts.append(
         f'<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;'
-        f'max-width:800px;margin:0 auto;color:{C["text"]};background:{C["page_bg"]};padding:20px;">'
+        f'max-width:640px;margin:0 auto;color:{C["text"]};">'
     )
     parts.append(
-        f'<div style="background:#1d4ed8;background:linear-gradient(135deg,#1d4ed8,#2563eb);'
+        f'<div style="background:#0d9488;background:linear-gradient(135deg,#0d9488,#2563eb);'
         f'border-radius:10px;padding:20px 22px;margin-bottom:20px;">'
         f'<h1 style="font-size:21px;margin:0 0 4px;color:#ffffff;">&#128176; Tỷ giá quy đổi sang VND</h1>'
-        f'<div style="font-size:13px;color:#dbeafe;">'
+        f'<div style="font-size:13px;color:#e0f2fe;">'
         f"{now_vn().strftime('%Y-%m-%d %H:%M')} (giờ Việt Nam)</div>"
         f'</div>'
     )
@@ -1042,10 +1327,10 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
                 change_cell = _html_change_span(pct)
             summary_rows += (
                 f'<tr>'
-                f'<td class="crx-td" style="padding:7px 0;border-bottom:1px solid rgba(0,0,0,0.06);font-size:14px;white-space:nowrap;">{_html_label(code)}</td>'
-                f'<td class="crx-td crx-muted" style="padding:7px 10px;border-bottom:1px solid rgba(0,0,0,0.06);font-size:12.5px;color:{_HTML_COLORS["muted"]};white-space:nowrap;">{_html_escape(name)}</td>'
-                f'<td class="crx-td" style="padding:7px 0;border-bottom:1px solid rgba(0,0,0,0.06);font-size:14px;font-weight:600;text-align:right;white-space:nowrap;">{rate:,.2f} VND</td>'
-                f'<td class="crx-td" style="padding:7px 0 7px 12px;border-bottom:1px solid rgba(0,0,0,0.06);text-align:right;white-space:nowrap;">{change_cell}</td>'
+                f'<td class="crx-td" style="padding:7px 0;border-bottom:1px solid rgba(0,0,0,0.06);font-size:14px;">{_html_label(code)}</td>'
+                f'<td class="crx-td crx-muted" style="padding:7px 10px;border-bottom:1px solid rgba(0,0,0,0.06);font-size:12.5px;color:{_HTML_COLORS["muted"]};">{_html_escape(name)}</td>'
+                f'<td class="crx-td" style="padding:7px 0;border-bottom:1px solid rgba(0,0,0,0.06);font-size:14px;font-weight:600;text-align:right;">{rate:,.2f} VND</td>'
+                f'<td class="crx-td" style="padding:7px 0 7px 12px;border-bottom:1px solid rgba(0,0,0,0.06);text-align:right;">{change_cell}</td>'
                 f'</tr>'
             )
         parts.append(
@@ -1053,9 +1338,7 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
             f'padding:14px 18px 6px;margin-bottom:20px;">'
             f'<div class="crx-muted" style="font-size:12px;font-weight:700;color:{_HTML_COLORS["muted"]};text-transform:uppercase;'
             f'letter-spacing:.03em;margin-bottom:6px;">Xem nhanh &middot; tỷ giá trung bình thị trường</div>'
-            f'<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">'
-            f'<table style="border-collapse:collapse;min-width:480px;">{summary_rows}</table>'
-            f'</div>'
+            f'<table style="border-collapse:collapse;width:100%;">{summary_rows}</table>'
             f'</div>'
         )
 
@@ -1075,10 +1358,7 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
             f'{worst_rate:,.2f} <span class="crx-muted" style="color:{C["muted"]};font-size:12px;">({_html_escape(worst_source)})</span>',
         ))
     if best_rows:
-        table = _html_source_table(
-            best_rows, ["Loại tiền", "Cao nhất", "Thấp nhất"],
-            accent=SECTION_ACCENTS["best"], accent_key="best", scroll_min_width="700px",
-        )
+        table = _html_source_table(best_rows, ["Loại tiền", "Cao nhất", "Thấp nhất"], accent=SECTION_ACCENTS["best"], accent_key="best")
         parts.append(_html_card(
             "Tỷ giá cao nhất / thấp nhất theo nguồn", table,
             "So sánh giữa các nguồn bên dưới, theo từng loại tiền",
@@ -1096,10 +1376,7 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
         if spread_pct >= DISCREPANCY_THRESHOLD_PERCENT:
             disc_rows.append((f"<strong>{_html_label(code)}</strong>", f"{spread_pct:.2f}%", f"{min_rate:,.2f} - {max_rate:,.2f} VND"))
     if disc_rows:
-        table = _html_source_table(
-            disc_rows, ["Loại tiền", "Chênh lệch", "Khoảng"],
-            accent=SECTION_ACCENTS["discrepancy"], accent_key="discrepancy", scroll_min_width="500px",
-        )
+        table = _html_source_table(disc_rows, ["Loại tiền", "Chênh lệch", "Khoảng"], accent=SECTION_ACCENTS["discrepancy"], accent_key="discrepancy")
         parts.append(_html_card(
             f"&#9888; Cảnh báo chênh lệch giữa các nguồn (&ge;{DISCREPANCY_THRESHOLD_PERCENT:.1f}%)",
             table,
@@ -1120,11 +1397,7 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
             row.append(f"{val:,.2f}" if val is not None else f'<span class="crx-muted" style="color:{C["muted"]};">—</span>')
         compare_rows.append(tuple(row))
     if compare_rows:
-        table = _html_source_table(
-            compare_rows, ["Loại tiền"] + SOURCE_SHORT_NAMES,
-            accent=SECTION_ACCENTS["compare"], accent_key="compare",
-            scroll_min_width=f"{90 + 110 * len(SOURCE_SHORT_NAMES)}px",
-        )
+        table = _html_source_table(compare_rows, ["Loại tiền"] + SOURCE_SHORT_NAMES, accent=SECTION_ACCENTS["compare"], accent_key="compare")
         parts.append(_html_card(
             "Bảng so sánh tất cả các nguồn", table,
             "Vietcombank hiển thị giá trị trung bình mua/bán",
@@ -1242,11 +1515,7 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
                 converted = amount / rates[code]
                 row.append(f"{symbol_for(code)}{converted:,.2f}")
             conv_rows.append(tuple(row))
-        table = _html_source_table(
-            conv_rows, ["Loại tiền"] + amount_headers,
-            accent=SECTION_ACCENTS["conversions"], accent_key="conversions",
-            scroll_min_width=f"{90 + 110 * len(amount_headers)}px",
-        )
+        table = _html_source_table(conv_rows, ["Loại tiền"] + amount_headers, accent=SECTION_ACCENTS["conversions"], accent_key="conversions")
         parts.append(_html_card(
             "Quy đổi nhanh", table,
             f"Tính theo {_html_escape(SOURCES[0][0])}",
@@ -1262,6 +1531,45 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
             _html_source_table(rows, ["Loại tiền", "Thay đổi"], accent=SECTION_ACCENTS["trend"], accent_key="trend"),
             f"Tính theo lịch sử {_html_escape(SOURCES[0][0])}, ghi lại mỗi lần chạy",
             accent=SECTION_ACCENTS["trend"], accent_key="trend",
+        ))
+
+    # Rate charts (1 week / 1 month / 1 year)
+    if chart_results:
+        chart_accent = SECTION_ACCENTS["chart"]
+        cache_bust = int(now_vn().timestamp())
+        blocks = []
+        for r in chart_results:
+            blocks.append(
+                f'<div style="font-size:13px;font-weight:700;color:{C["text"]};margin:14px 0 6px;">{_html_escape(r["label"])}</div>'
+            )
+            if r["ok"] and CHART_BASE_URL:
+                blocks.append(
+                    f'<img src="{_chart_image_url(r["key"], cache_bust)}" width="600" alt="Biểu đồ tỷ giá {_html_escape(r["label"])}" '
+                    f'style="width:100%;max-width:600px;height:auto;display:block;border-radius:6px;border:1px solid {C["border"]};">'
+                )
+                if r["coverage_days"] < r["days"] - 1:
+                    blocks.append(
+                        f'<div class="crx-muted" style="font-size:11.5px;color:{C["muted"]};margin-top:4px;">'
+                        f'Mới có {r["coverage_days"]:.1f} ngày dữ liệu — biểu đồ sẽ đầy dần theo thời gian.</div>'
+                    )
+            elif r["ok"]:
+                # Chart was rendered but there's nowhere public to host it from (e.g.
+                # running outside GitHub Actions with no CHART_BASE_URL override).
+                blocks.append(
+                    f'<div class="crx-muted" style="font-size:12.5px;color:{C["muted"]};">'
+                    f'Đã tạo biểu đồ nhưng chưa có URL công khai để hiển thị (thiếu CHART_BASE_URL / GITHUB_REPOSITORY).</div>'
+                )
+            else:
+                blocks.append(
+                    f'<div class="crx-muted" style="font-size:12.5px;color:{C["muted"]};">'
+                    f'Chưa đủ dữ liệu lịch sử cho khoảng {_html_escape(r["label"])} — sẽ hiển thị khi đã tích lũy đủ.</div>'
+                )
+        parts.append(_html_card(
+            "Biểu đồ tỷ giá theo thời gian", "".join(blocks),
+            f"Tính theo lịch sử {_html_escape(SOURCES[0][0])}, ghi lại mỗi lần chạy",
+            accent=chart_accent, accent_key="chart",
+            description="Mỗi loại tiền một biểu đồ riêng (tỷ giá VND thực tế theo thời gian), để dễ theo dõi từng loại "
+                         "thay vì chồng lên nhau trên cùng một trục.",
         ))
 
     # Sources footer
@@ -1330,12 +1638,12 @@ def build_alert_body_html(errors):
     )
     inner = (
         f'<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;'
-        f'max-width:800px;margin:0 auto;color:{C["text"]};background:{C["page_bg"]};padding:20px;">'
+        f'max-width:640px;margin:0 auto;color:{C["text"]};">'
         f'<div style="background:{C["down"]};border-radius:10px;padding:20px 22px;margin-bottom:20px;">'
         f'<h1 style="font-size:20px;margin:0 0 4px;color:#ffffff;">&#128680; Cảnh báo: Tất cả nguồn tỷ giá đều lỗi</h1>'
         f'<div style="font-size:13px;color:#fee2e2;">{now_vn().strftime("%Y-%m-%d %H:%M")} (giờ Việt Nam)</div>'
         f'</div>'
-        f'<div class="crx-card" style="border:1px solid {C["border"]};border-radius:8px;padding:16px 18px;background:{C["card_bg"]};">'
+        f'<div class="crx-card" style="border:1px solid {C["border"]};border-radius:8px;padding:16px 18px;">'
         f'<div style="font-size:14px;margin-bottom:12px;">Cả {len(errors)} nguồn dữ liệu đều gặp lỗi trong lần chạy này, '
         f'nên không có tỷ giá nào để gửi.</div>'
         f'{rows}'
@@ -1366,7 +1674,7 @@ def cmd_generate():
     # skipped by a threshold check that has nothing to compare.
     if rates and not should_send(rates, previous_rates):
         print("No significant change, skipping email.")
-        open(EMAIL_BODY_FILE, "w").close()
+        open(EMAIL_BODY_FILE, "w", encoding="utf-8").close()
         return
 
     try:
@@ -1418,23 +1726,29 @@ def cmd_generate():
         body = build_alert_body_text(errors)
         html_body = build_alert_body_html(errors)
         subject = f"🚨 CẢNH BÁO: Tất cả nguồn tỷ giá đều lỗi - {now_vn().strftime('%Y-%m-%d %H:%M')}"
-        with open(EMAIL_BODY_FILE, "w") as f:
+        with open(EMAIL_BODY_FILE, "w", encoding="utf-8") as f:
             f.write(body)
-        with open(EMAIL_HTML_FILE, "w") as f:
+        with open(EMAIL_HTML_FILE, "w", encoding="utf-8") as f:
             f.write(html_body)
-        with open(EMAIL_SUBJECT_FILE, "w") as f:
+        with open(EMAIL_SUBJECT_FILE, "w", encoding="utf-8") as f:
             f.write(subject)
         print(body)
         # No new data was fetched — don't overwrite the rate cache or history.
         return
 
+    # Rendered from rate_history.csv plus this run's not-yet-saved rates, so the
+    # charts stay in sync with the rate table below rather than lagging one run.
+    chart_results = generate_rate_charts(rates)
+
     body = format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
-                              vcb_error, fawaz_error, fxrates_error, coingecko_error, market_error)
+                              vcb_error, fawaz_error, fxrates_error, coingecko_error, market_error,
+                              chart_results=chart_results)
     html_body = format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
-                                   vcb_error, fawaz_error, fxrates_error, coingecko_error, market_error)
-    with open(EMAIL_BODY_FILE, "w") as f:
+                                   vcb_error, fawaz_error, fxrates_error, coingecko_error, market_error,
+                                   chart_results=chart_results)
+    with open(EMAIL_BODY_FILE, "w", encoding="utf-8") as f:
         f.write(body)
-    with open(EMAIL_HTML_FILE, "w") as f:
+    with open(EMAIL_HTML_FILE, "w", encoding="utf-8") as f:
         f.write(html_body)
     # Clear any leftover alert subject from a previous failed run, so a normal
     # run always uses the normal subject format.
@@ -1452,7 +1766,7 @@ def cmd_send():
         print("No email body found, run 'generate' first.")
         return
 
-    with open(EMAIL_BODY_FILE) as f:
+    with open(EMAIL_BODY_FILE, encoding="utf-8") as f:
         body = f.read()
 
     if not body.strip():
@@ -1461,17 +1775,20 @@ def cmd_send():
 
     html_body = None
     if os.path.exists(EMAIL_HTML_FILE):
-        with open(EMAIL_HTML_FILE) as f:
+        with open(EMAIL_HTML_FILE, encoding="utf-8") as f:
             html_body = f.read().strip() or None
 
     subject = None
     if os.path.exists(EMAIL_SUBJECT_FILE):
-        with open(EMAIL_SUBJECT_FILE) as f:
+        with open(EMAIL_SUBJECT_FILE, encoding="utf-8") as f:
             subject = f.read().strip() or None
 
     if not (GMAIL_ADDRESS and GMAIL_APP_PASSWORD and CURRENCY_RECIPIENT):
-        print("GMAIL_ADDRESS / GMAIL_APP_PASSWORD / CURRENCY_RECIPIENT not set, skipping send.")
-        return
+        print(
+            "GMAIL_ADDRESS / GMAIL_APP_PASSWORD / CURRENCY_RECIPIENT not set; cannot send.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     send_email(body, html_body, subject)
     print("Email sent.")
