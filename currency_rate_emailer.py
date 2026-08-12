@@ -274,6 +274,23 @@ CHART_SPECS = [
 ]
 CHART_FILE_TEMPLATE = "chart_{}.png"  # -> chart_1w.png, chart_1m.png, chart_1y.png
 
+# Image-map hover regions (see render_rate_chart) add real weight to the
+# email — roughly 100-150 bytes per <area>, and Gmail clips messages past
+# ~102KB total. Scoped to just the most-checked range rather than all three,
+# to keep a real safety margin below that limit regardless of how much the
+# rest of the email's content (discrepancy flags, watchlist size, etc.)
+# varies run to run. The other ranges keep the static current-value/range
+# labels already drawn on the chart image itself.
+INTERACTIVE_CHART_RANGES = {"1w"}
+
+# The interactive chart can't use the email's usual responsive width:100%
+# treatment (image-map coordinates don't scale with a resized image — see
+# render_rate_chart), so it's rendered directly at a fixed natural size
+# instead. 580px keeps it inside the email card's actual content width
+# (640px outer wrapper minus 18px of padding on each side = 604px available).
+INTERACTIVE_CHART_PANEL_SIZE_IN = (1.25, 0.88)
+INTERACTIVE_CHART_DPI = 155
+
 
 # Where the committed chart PNGs are publicly reachable, so the email can
 # link to them by URL instead of attaching them. Gmail was observed showing
@@ -587,7 +604,7 @@ def _read_history_rows():
     return rows
 
 
-def render_rate_chart(history_rows, days):
+def render_rate_chart(history_rows, days, checkpoints_per_panel=4, panel_size_in=(3.05, 2.15), dpi=170):
     """Builds a grid of small per-currency charts — one panel per
     CHART_CURRENCIES currency, each showing that currency's own raw VND
     rate as a line — over the trailing `days` days.
@@ -602,8 +619,29 @@ def render_rate_chart(history_rows, days):
     the rest of the email, since panels no longer compete for distinguishable
     colors the way overlaid lines did.
 
-    Returns (png_bytes, earliest_timestamp_plotted), or None if no currency
-    has at least 2 data points in the window (nothing usable to plot).
+    Also computes hover regions for an HTML image map: email clients run no
+    JavaScript and (Gmail specifically) strip <style> blocks and disallow
+    absolute positioning, which rules out both JS tooltips and CSS-only
+    (:hover) ones. An <area title="..."> inside a <map>, though, is a plain
+    HTML mechanism from HTML 3.2 with no dependency on either — hovering
+    it shows the browser's native tooltip. caniemail.com lists image maps
+    as supported in Gmail. Coordinates are computed from each axes'
+    get_position() (figure-fraction, queried after layout) rather than
+    matplotlib's transData, so nothing here depends on bbox_inches="tight"
+    cropping — savefig() below deliberately omits it so the saved PNG's
+    pixel dimensions are exactly figsize * dpi and match this math exactly.
+
+    Image maps use static, unscaled pixel coordinates — confirmed by testing
+    that neither CSS nor HTML width/height resizing keeps <area coords>
+    aligned with a resized image (this is a documented HTML limitation;
+    JavaScript is the standard fix, not available in email). So a chart
+    that will carry an image map should be rendered at panel_size_in/dpi
+    tuned to come out near its final *displayed* size already, rather than
+    relying on the email's usual responsive width:100% treatment.
+
+    Returns (png_bytes, earliest_timestamp_plotted, width_px, height_px, areas)
+    — areas is [{"cx", "cy", "r", "title"}, ...] in saved-PNG pixel space —
+    or None if no currency has at least 2 data points in the window.
     """
     cutoff = now_vn() - timedelta(days=days)
     by_code = {}
@@ -630,9 +668,10 @@ def render_rate_chart(history_rows, days):
     n = len(plotted_codes)
     cols = min(3, n)
     rows = (n + cols - 1) // cols  # ceil division
+    figsize = (panel_size_in[0] * cols, panel_size_in[1] * rows)
 
     fig, axes = plt.subplots(
-        rows, cols, figsize=(3.05 * cols, 2.15 * rows), dpi=170,
+        rows, cols, figsize=figsize, dpi=dpi,
         sharex=True, squeeze=False,
     )
     fig.patch.set_facecolor("#ffffff")  # fixed white background: the image can't
@@ -650,6 +689,19 @@ def render_rate_chart(history_rows, days):
     else:
         date_fmt = "%m/%Y"
 
+    # Evenly spaced checkpoint times shared by every panel (each panel then
+    # snaps each checkpoint to its own nearest real data point, or skips it
+    # if none is close enough — e.g. a currency with a shorter history than
+    # others sharing this chart).
+    span_seconds = (latest - earliest).total_seconds()
+    checkpoint_times = [
+        earliest + timedelta(seconds=span_seconds * i / (checkpoints_per_panel - 1))
+        for i in range(checkpoints_per_panel)
+    ] if span_seconds > 0 else [earliest]
+    snap_tolerance = timedelta(seconds=span_seconds / checkpoints_per_panel) if span_seconds > 0 else timedelta(days=1)
+
+    panel_info = []  # (ax, code, color, points) for the pixel-mapping pass below
+
     for idx, ax in enumerate(axes.flat):
         ax.set_facecolor("#ffffff")
         if idx >= n:
@@ -664,11 +716,11 @@ def render_rate_chart(history_rows, days):
             [p[0] for p in points], vals,
             color=color, linewidth=1.6, solid_capstyle="round",
         )
+        panel_info.append((ax, code, color, points))
 
-        # Email images can't respond to a hover, so the values someone would
-        # want from pointing at the line are placed on the chart instead:
-        # the latest point is marked and labeled, and low/high for the
-        # window are printed underneath.
+        # Static fallback (screen readers, clients without image-map support,
+        # and a general at-a-glance reading): latest value + range, printed
+        # directly on the chart, plus a dot marking the latest point.
         last_ts, last_val = points[-1]
         ax.plot([last_ts], [last_val], marker="o", markersize=3.5, color=color, zorder=5)
         ax.text(
@@ -698,10 +750,43 @@ def render_rate_chart(history_rows, days):
     fig.autofmt_xdate(rotation=30, ha="right")
     fig.tight_layout(h_pad=1.4, w_pad=1.2)
 
+    # Pixel-map the hover checkpoints now that layout (and therefore each
+    # axes' get_position()) is final. width/height match figsize * dpi
+    # exactly because savefig() below does not crop with bbox_inches.
+    width_px = round(figsize[0] * dpi)
+    height_px = round(figsize[1] * dpi)
+    area_radius = 13
+    min_spacing = area_radius * 2 + 6  # skip a checkpoint that would overlap the
+                                        # previous kept one — verified by testing
+                                        # that an overlapping <area> silently
+                                        # shadows its neighbor, since the browser
+                                        # hit-tests in DOM order and the first
+                                        # match wins
+    areas = []
+    for ax, code, color, points in panel_info:
+        pos = ax.get_position()
+        xlim, ylim = ax.get_xlim(), ax.get_ylim()  # get_xlim() is already a date-num float, not a datetime
+        last_px_x = None
+        for cp_time in checkpoint_times:
+            nearest_ts, nearest_val = min(points, key=lambda p: abs((p[0] - cp_time).total_seconds()))
+            if abs(nearest_ts - cp_time) > snap_tolerance:
+                continue
+            frac_x = (mdates.date2num(nearest_ts) - xlim[0]) / (xlim[1] - xlim[0])
+            frac_y = (nearest_val - ylim[0]) / (ylim[1] - ylim[0])
+            px_x = (pos.x0 + frac_x * (pos.x1 - pos.x0)) * width_px
+            px_y = height_px - (pos.y0 + frac_y * (pos.y1 - pos.y0)) * height_px  # flip: figure-fraction origin is bottom-left, image origin is top-left
+            if last_px_x is not None and abs(px_x - last_px_x) < min_spacing:
+                continue
+            last_px_x = px_x
+            areas.append({
+                "cx": round(px_x), "cy": round(px_y), "r": area_radius,
+                "title": f"{nearest_val:,.2f} VND \u2014 {nearest_ts.strftime('%d/%m %H:%M')}",
+            })
+
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", facecolor="#ffffff")
+    fig.savefig(buf, format="png", facecolor="#ffffff")  # no bbox_inches="tight": keeps saved size == figsize*dpi
     plt.close(fig)
-    return buf.getvalue(), earliest
+    return buf.getvalue(), earliest, width_px, height_px, areas
 
 
 def generate_rate_charts(current_rates):
@@ -731,17 +816,24 @@ def generate_rate_charts(current_rates):
         if os.path.exists(path):
             os.remove(path)  # avoid ever attaching a stale image from a previous run
 
-        rendered = render_rate_chart(history_rows, days)
+        if key in INTERACTIVE_CHART_RANGES:
+            rendered = render_rate_chart(
+                history_rows, days,
+                panel_size_in=INTERACTIVE_CHART_PANEL_SIZE_IN, dpi=INTERACTIVE_CHART_DPI,
+            )
+        else:
+            rendered = render_rate_chart(history_rows, days)
         if rendered is None:
             results.append({"key": key, "label": label, "days": days, "ok": False})
             continue
 
-        png_bytes, earliest = rendered
+        png_bytes, earliest, width_px, height_px, areas = rendered
         with open(path, "wb") as f:
             f.write(png_bytes)
         results.append({
             "key": key, "label": label, "days": days, "ok": True, "path": path,
             "coverage_days": (now_vn() - earliest).total_seconds() / 86400,
+            "width_px": width_px, "height_px": height_px, "areas": areas,
         })
     return results
 
@@ -1543,10 +1635,44 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
                 f'<div style="font-size:13px;font-weight:700;color:{C["text"]};margin:14px 0 6px;">{_html_escape(r["label"])}</div>'
             )
             if r["ok"] and CHART_BASE_URL:
+                interactive = r["key"] in INTERACTIVE_CHART_RANGES
+                map_name = f"chart-map-{r['key']}"
+                if interactive:
+                    # Fixed, unscaled size: testing showed <area coords> do NOT
+                    # follow a resized image — neither CSS width:100% nor an HTML
+                    # width attribute rescales them (this is a documented HTML
+                    # limitation; the standard fix is JavaScript recomputing
+                    # coords on resize, not available in email). So this image is
+                    # rendered directly at the size it's displayed at, sized to
+                    # fit inside the card's content width (see
+                    # INTERACTIVE_CHART_PANEL_SIZE_IN), rather than scaled via CSS.
+                    img_size_attrs = f'width="{r["width_px"]}" height="{r["height_px"]}"'
+                    img_style = f'display:block;border-radius:6px;border:1px solid {C["border"]};'
+                    usemap_attr = f'usemap="#{map_name}" '
+                else:
+                    img_size_attrs = 'width="600"'
+                    img_style = f'width:100%;max-width:600px;height:auto;display:block;border-radius:6px;border:1px solid {C["border"]};'
+                    usemap_attr = ""
                 blocks.append(
-                    f'<img src="{_chart_image_url(r["key"], cache_bust)}" width="600" alt="Biểu đồ tỷ giá {_html_escape(r["label"])}" '
-                    f'style="width:100%;max-width:600px;height:auto;display:block;border-radius:6px;border:1px solid {C["border"]};">'
+                    f'<img src="{_chart_image_url(r["key"], cache_bust)}" {img_size_attrs} '
+                    f'{usemap_attr}alt="Biểu đồ tỷ giá {_html_escape(r["label"])}" '
+                    f'style="{img_style}">'
                 )
+                if interactive:
+                    # A plain HTML image map: hovering an <area> shows the browser's
+                    # native title tooltip with the exact value at that point. No CSS
+                    # or JS involved — Gmail strips <style> blocks entirely and
+                    # disallows absolute positioning, which rules out both a CSS-only
+                    # :hover tooltip and a JS one, but caniemail.com lists plain image
+                    # maps as supported in Gmail. Coordinates are in the saved PNG's
+                    # native pixel size, matching the img width/height above exactly
+                    # (unscaled) — see the note above on why this can't be responsive.
+                    areas_html = "".join(
+                        f'<area shape="circle" coords="{a["cx"]},{a["cy"]},{a["r"]}" '
+                        f'title="{_html_escape(a["title"]).replace(chr(34), "&quot;")}" href="#">'
+                        for a in r["areas"]
+                    )
+                    blocks.append(f'<map name="{map_name}">{areas_html}</map>')
                 if r["coverage_days"] < r["days"] - 1:
                     blocks.append(
                         f'<div class="crx-muted" style="font-size:11.5px;color:{C["muted"]};margin-top:4px;">'
