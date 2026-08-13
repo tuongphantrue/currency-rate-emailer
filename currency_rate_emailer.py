@@ -755,32 +755,41 @@ def render_rate_chart(history_rows, days, checkpoints_per_panel=4, panel_size_in
     # exactly because savefig() below does not crop with bbox_inches.
     width_px = round(figsize[0] * dpi)
     height_px = round(figsize[1] * dpi)
-    area_radius = 13
-    min_spacing = area_radius * 2 + 6  # skip a checkpoint that would overlap the
-                                        # previous kept one — verified by testing
-                                        # that an overlapping <area> silently
-                                        # shadows its neighbor, since the browser
-                                        # hit-tests in DOM order and the first
-                                        # match wins
     areas = []
     for ax, code, color, points in panel_info:
         pos = ax.get_position()
-        xlim, ylim = ax.get_xlim(), ax.get_ylim()  # get_xlim() is already a date-num float, not a datetime
-        last_px_x = None
+        xlim = ax.get_xlim()  # already a date-num float, not a datetime
+        panel_left = pos.x0 * width_px
+        panel_right = pos.x1 * width_px
+        panel_top = height_px - pos.y1 * height_px
+        panel_bottom = height_px - pos.y0 * height_px
+
+        checkpoints = []  # (px_x, title) for this panel, left to right
         for cp_time in checkpoint_times:
             nearest_ts, nearest_val = min(points, key=lambda p: abs((p[0] - cp_time).total_seconds()))
             if abs(nearest_ts - cp_time) > snap_tolerance:
                 continue
             frac_x = (mdates.date2num(nearest_ts) - xlim[0]) / (xlim[1] - xlim[0])
-            frac_y = (nearest_val - ylim[0]) / (ylim[1] - ylim[0])
-            px_x = (pos.x0 + frac_x * (pos.x1 - pos.x0)) * width_px
-            px_y = height_px - (pos.y0 + frac_y * (pos.y1 - pos.y0)) * height_px  # flip: figure-fraction origin is bottom-left, image origin is top-left
-            if last_px_x is not None and abs(px_x - last_px_x) < min_spacing:
-                continue
-            last_px_x = px_x
+            px_x = pos.x0 * width_px + frac_x * (panel_right - panel_left)
+            title = f"{nearest_val:,.2f} VND \u2014 {nearest_ts.strftime('%d/%m %H:%M')}"
+            if checkpoints and abs(px_x - checkpoints[-1][0]) < 4:
+                continue  # two checkpoints landed on ~the same pixel column; keep one
+            checkpoints.append((px_x, title))
+
+        # Hoverable area covers the panel's *entire* width and height, not a small
+        # target at each point: this is a deliberate trade-off of precision for
+        # discoverability. A hit region tight around the exact line pixel requires
+        # a steady, accurate hover to land on it — easy to miss entirely, which
+        # looks identical to the feature simply not working. Splitting the full
+        # panel into vertical strips at the midpoint between adjacent checkpoints
+        # (so strips can never overlap, by construction) means hovering *anywhere*
+        # over a panel shows a real, nearby value.
+        for i, (px_x, title) in enumerate(checkpoints):
+            left = panel_left if i == 0 else (checkpoints[i - 1][0] + px_x) / 2
+            right = panel_right if i == len(checkpoints) - 1 else (px_x + checkpoints[i + 1][0]) / 2
             areas.append({
-                "cx": round(px_x), "cy": round(px_y), "r": area_radius,
-                "title": f"{nearest_val:,.2f} VND \u2014 {nearest_ts.strftime('%d/%m %H:%M')}",
+                "coords": f"{round(left)},{round(panel_top)},{round(right)},{round(panel_bottom)}",
+                "title": title,
             })
 
     buf = io.BytesIO()
@@ -1667,8 +1676,13 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
                     # maps as supported in Gmail. Coordinates are in the saved PNG's
                     # native pixel size, matching the img width/height above exactly
                     # (unscaled) — see the note above on why this can't be responsive.
+                    # Each area is a full-panel-height vertical strip rather than a
+                    # small target at the exact point — much more forgiving to hover,
+                    # since a tight hit region is easy to miss entirely (which looks
+                    # identical to the feature not working) and native title tooltips
+                    # already require a steady ~1s hover to appear at all.
                     areas_html = "".join(
-                        f'<area shape="circle" coords="{a["cx"]},{a["cy"]},{a["r"]}" '
+                        f'<area shape="rect" coords="{a["coords"]}" '
                         f'title="{_html_escape(a["title"]).replace(chr(34), "&quot;")}" href="#">'
                         for a in r["areas"]
                     )
