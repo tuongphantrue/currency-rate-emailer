@@ -274,23 +274,6 @@ CHART_SPECS = [
 ]
 CHART_FILE_TEMPLATE = "chart_{}.png"  # -> chart_1w.png, chart_1m.png, chart_1y.png
 
-# Image-map hover regions (see render_rate_chart) add real weight to the
-# email — roughly 100-150 bytes per <area>, and Gmail clips messages past
-# ~102KB total. Scoped to just the most-checked range rather than all three,
-# to keep a real safety margin below that limit regardless of how much the
-# rest of the email's content (discrepancy flags, watchlist size, etc.)
-# varies run to run. The other ranges keep the static current-value/range
-# labels already drawn on the chart image itself.
-INTERACTIVE_CHART_RANGES = {"1w"}
-
-# The interactive chart can't use the email's usual responsive width:100%
-# treatment (image-map coordinates don't scale with a resized image — see
-# render_rate_chart), so it's rendered directly at a fixed natural size
-# instead. 580px keeps it inside the email card's actual content width
-# (640px outer wrapper minus 18px of padding on each side = 604px available).
-INTERACTIVE_CHART_PANEL_SIZE_IN = (1.25, 0.88)
-INTERACTIVE_CHART_DPI = 155
-
 
 # Where the committed chart PNGs are publicly reachable, so the email can
 # link to them by URL instead of attaching them. Gmail was observed showing
@@ -318,6 +301,19 @@ def _chart_image_url(key, cache_bust):
     cache by URL, so without this an old chart could keep showing well
     after a fresher one was published."""
     return f"{CHART_BASE_URL}/{CHART_FILE_TEMPLATE.format(key)}?t={cache_bust}"
+
+
+# Public URL for the interactive dashboard (see generate_interactive_dashboard),
+# a GitHub Pages site built from the same GITHUB_REPOSITORY/GITHUB_REF_NAME
+# GitHub Actions sets automatically. Requires Pages enabled once in the repo's
+# own settings (Settings > Pages > Deploy from a branch > main > /docs) —
+# something only the repo owner can do, not this script.
+_gh_repo_for_pages = os.environ.get("GITHUB_REPOSITORY")
+if _gh_repo_for_pages:
+    _pages_owner, _pages_repo = _gh_repo_for_pages.split("/", 1)
+    DASHBOARD_URL = f"https://{_pages_owner}.github.io/{_pages_repo}/"
+else:
+    DASHBOARD_URL = None
 
 
 # Which currencies to plot. Defaults to the full watchlist; can be narrowed
@@ -604,7 +600,7 @@ def _read_history_rows():
     return rows
 
 
-def render_rate_chart(history_rows, days, checkpoints_per_panel=4, panel_size_in=(3.05, 2.15), dpi=170):
+def render_rate_chart(history_rows, days):
     """Builds a grid of small per-currency charts — one panel per
     CHART_CURRENCIES currency, each showing that currency's own raw VND
     rate as a line — over the trailing `days` days.
@@ -619,29 +615,22 @@ def render_rate_chart(history_rows, days, checkpoints_per_panel=4, panel_size_in
     the rest of the email, since panels no longer compete for distinguishable
     colors the way overlaid lines did.
 
-    Also computes hover regions for an HTML image map: email clients run no
-    JavaScript and (Gmail specifically) strip <style> blocks and disallow
-    absolute positioning, which rules out both JS tooltips and CSS-only
-    (:hover) ones. An <area title="..."> inside a <map>, though, is a plain
-    HTML mechanism from HTML 3.2 with no dependency on either — hovering
-    it shows the browser's native tooltip. caniemail.com lists image maps
-    as supported in Gmail. Coordinates are computed from each axes'
-    get_position() (figure-fraction, queried after layout) rather than
-    matplotlib's transData, so nothing here depends on bbox_inches="tight"
-    cropping — savefig() below deliberately omits it so the saved PNG's
-    pixel dimensions are exactly figsize * dpi and match this math exactly.
+    An earlier version of this function also computed an HTML image map
+    (<map>/<area title="...">) so hovering the 1-week chart in Gmail would
+    show a native tooltip with the exact value — no CSS or JS involved,
+    since Gmail runs neither. It worked in every test here, including
+    simulated real mouse hovers checked via actual browser events, not just
+    visual inspection. It did not work in the user's real Gmail, on two
+    separate attempts (a small-circle version, then a full-panel-strip
+    version), despite caniemail.com listing image maps as Gmail-supported.
+    Real-world results from the actual target client outrank both a
+    compatibility table and a controlled test, so that approach was dropped
+    rather than iterated on further — see generate_interactive_dashboard()
+    for the real-hover option this project uses instead (a separate page,
+    genuine JS, linked from the email rather than embedded in it).
 
-    Image maps use static, unscaled pixel coordinates — confirmed by testing
-    that neither CSS nor HTML width/height resizing keeps <area coords>
-    aligned with a resized image (this is a documented HTML limitation;
-    JavaScript is the standard fix, not available in email). So a chart
-    that will carry an image map should be rendered at panel_size_in/dpi
-    tuned to come out near its final *displayed* size already, rather than
-    relying on the email's usual responsive width:100% treatment.
-
-    Returns (png_bytes, earliest_timestamp_plotted, width_px, height_px, areas)
-    — areas is [{"cx", "cy", "r", "title"}, ...] in saved-PNG pixel space —
-    or None if no currency has at least 2 data points in the window.
+    Returns (png_bytes, earliest_timestamp_plotted), or None if no currency
+    has at least 2 data points in the window (nothing usable to plot).
     """
     cutoff = now_vn() - timedelta(days=days)
     by_code = {}
@@ -668,10 +657,9 @@ def render_rate_chart(history_rows, days, checkpoints_per_panel=4, panel_size_in
     n = len(plotted_codes)
     cols = min(3, n)
     rows = (n + cols - 1) // cols  # ceil division
-    figsize = (panel_size_in[0] * cols, panel_size_in[1] * rows)
 
     fig, axes = plt.subplots(
-        rows, cols, figsize=figsize, dpi=dpi,
+        rows, cols, figsize=(3.05 * cols, 2.15 * rows), dpi=170,
         sharex=True, squeeze=False,
     )
     fig.patch.set_facecolor("#ffffff")  # fixed white background: the image can't
@@ -689,19 +677,6 @@ def render_rate_chart(history_rows, days, checkpoints_per_panel=4, panel_size_in
     else:
         date_fmt = "%m/%Y"
 
-    # Evenly spaced checkpoint times shared by every panel (each panel then
-    # snaps each checkpoint to its own nearest real data point, or skips it
-    # if none is close enough — e.g. a currency with a shorter history than
-    # others sharing this chart).
-    span_seconds = (latest - earliest).total_seconds()
-    checkpoint_times = [
-        earliest + timedelta(seconds=span_seconds * i / (checkpoints_per_panel - 1))
-        for i in range(checkpoints_per_panel)
-    ] if span_seconds > 0 else [earliest]
-    snap_tolerance = timedelta(seconds=span_seconds / checkpoints_per_panel) if span_seconds > 0 else timedelta(days=1)
-
-    panel_info = []  # (ax, code, color, points) for the pixel-mapping pass below
-
     for idx, ax in enumerate(axes.flat):
         ax.set_facecolor("#ffffff")
         if idx >= n:
@@ -716,11 +691,11 @@ def render_rate_chart(history_rows, days, checkpoints_per_panel=4, panel_size_in
             [p[0] for p in points], vals,
             color=color, linewidth=1.6, solid_capstyle="round",
         )
-        panel_info.append((ax, code, color, points))
 
-        # Static fallback (screen readers, clients without image-map support,
-        # and a general at-a-glance reading): latest value + range, printed
-        # directly on the chart, plus a dot marking the latest point.
+        # Email images can't respond to a hover, so the values someone would
+        # want from pointing at the line are placed on the chart instead:
+        # the latest point is marked and labeled, and low/high for the
+        # window are printed underneath.
         last_ts, last_val = points[-1]
         ax.plot([last_ts], [last_val], marker="o", markersize=3.5, color=color, zorder=5)
         ax.text(
@@ -750,52 +725,10 @@ def render_rate_chart(history_rows, days, checkpoints_per_panel=4, panel_size_in
     fig.autofmt_xdate(rotation=30, ha="right")
     fig.tight_layout(h_pad=1.4, w_pad=1.2)
 
-    # Pixel-map the hover checkpoints now that layout (and therefore each
-    # axes' get_position()) is final. width/height match figsize * dpi
-    # exactly because savefig() below does not crop with bbox_inches.
-    width_px = round(figsize[0] * dpi)
-    height_px = round(figsize[1] * dpi)
-    areas = []
-    for ax, code, color, points in panel_info:
-        pos = ax.get_position()
-        xlim = ax.get_xlim()  # already a date-num float, not a datetime
-        panel_left = pos.x0 * width_px
-        panel_right = pos.x1 * width_px
-        panel_top = height_px - pos.y1 * height_px
-        panel_bottom = height_px - pos.y0 * height_px
-
-        checkpoints = []  # (px_x, title) for this panel, left to right
-        for cp_time in checkpoint_times:
-            nearest_ts, nearest_val = min(points, key=lambda p: abs((p[0] - cp_time).total_seconds()))
-            if abs(nearest_ts - cp_time) > snap_tolerance:
-                continue
-            frac_x = (mdates.date2num(nearest_ts) - xlim[0]) / (xlim[1] - xlim[0])
-            px_x = pos.x0 * width_px + frac_x * (panel_right - panel_left)
-            title = f"{nearest_val:,.2f} VND \u2014 {nearest_ts.strftime('%d/%m %H:%M')}"
-            if checkpoints and abs(px_x - checkpoints[-1][0]) < 4:
-                continue  # two checkpoints landed on ~the same pixel column; keep one
-            checkpoints.append((px_x, title))
-
-        # Hoverable area covers the panel's *entire* width and height, not a small
-        # target at each point: this is a deliberate trade-off of precision for
-        # discoverability. A hit region tight around the exact line pixel requires
-        # a steady, accurate hover to land on it — easy to miss entirely, which
-        # looks identical to the feature simply not working. Splitting the full
-        # panel into vertical strips at the midpoint between adjacent checkpoints
-        # (so strips can never overlap, by construction) means hovering *anywhere*
-        # over a panel shows a real, nearby value.
-        for i, (px_x, title) in enumerate(checkpoints):
-            left = panel_left if i == 0 else (checkpoints[i - 1][0] + px_x) / 2
-            right = panel_right if i == len(checkpoints) - 1 else (px_x + checkpoints[i + 1][0]) / 2
-            areas.append({
-                "coords": f"{round(left)},{round(panel_top)},{round(right)},{round(panel_bottom)}",
-                "title": title,
-            })
-
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", facecolor="#ffffff")  # no bbox_inches="tight": keeps saved size == figsize*dpi
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor="#ffffff")
     plt.close(fig)
-    return buf.getvalue(), earliest, width_px, height_px, areas
+    return buf.getvalue(), earliest
 
 
 def generate_rate_charts(current_rates):
@@ -825,26 +758,342 @@ def generate_rate_charts(current_rates):
         if os.path.exists(path):
             os.remove(path)  # avoid ever attaching a stale image from a previous run
 
-        if key in INTERACTIVE_CHART_RANGES:
-            rendered = render_rate_chart(
-                history_rows, days,
-                panel_size_in=INTERACTIVE_CHART_PANEL_SIZE_IN, dpi=INTERACTIVE_CHART_DPI,
-            )
-        else:
-            rendered = render_rate_chart(history_rows, days)
+        rendered = render_rate_chart(history_rows, days)
         if rendered is None:
             results.append({"key": key, "label": label, "days": days, "ok": False})
             continue
 
-        png_bytes, earliest, width_px, height_px, areas = rendered
+        png_bytes, earliest = rendered
         with open(path, "wb") as f:
             f.write(png_bytes)
         results.append({
             "key": key, "label": label, "days": days, "ok": True, "path": path,
             "coverage_days": (now_vn() - earliest).total_seconds() / 86400,
-            "width_px": width_px, "height_px": height_px, "areas": areas,
         })
     return results
+
+
+def _downsample(points, max_points=360):
+    """Thins a sorted [(timestamp, rate), ...] list to at most max_points,
+    evenly spaced, so the dashboard's embedded JSON doesn't balloon for the
+    1-year range (which can otherwise carry tens of thousands of points per
+    currency at a 30-minute polling interval)."""
+    if len(points) <= max_points:
+        return points
+    step = len(points) / max_points
+    return [points[int(i * step)] for i in range(max_points)]
+
+
+_DASHBOARD_TEMPLATE = """<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>T\u1ef7 gi\u00e1 quy \u0111\u1ed5i sang VND</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f7f7f8; --surface: #ffffff; --border: #e4e4e7;
+    --text: #18181b; --muted: #71717a; --faint: #a1a1aa;
+    --accent: #a21caf; --accent-soft: #fae8ff; --accent-text: #86198f;
+    --positive: #16a34a; --negative: #dc2626; --grid-line: #f0f0f2;
+    --sidebar-w: 200px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0b0b0d; --surface: #17171a; --border: #2a2a2e;
+      --text: #f4f4f5; --muted: #a1a1aa; --faint: #71717a;
+      --accent: #e879f9; --accent-soft: #4a044e; --accent-text: #f0abfc;
+      --positive: #4ade80; --negative: #f87171; --grid-line: #232326;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .mono { font-family: ui-monospace, "SF Mono", "Cascadia Code", "Roboto Mono", Menlo, monospace; font-variant-numeric: tabular-nums; }
+
+  .shell { display: flex; min-height: 100vh; }
+
+  /* --- Sidebar: functional jump-nav across all tracked currencies, not decoration --- */
+  .sidebar {
+    width: var(--sidebar-w); flex-shrink: 0; background: var(--surface);
+    border-right: 1px solid var(--border); padding: 20px 12px;
+    position: sticky; top: 0; height: 100vh; overflow-y: auto;
+  }
+  .brand { display: flex; align-items: center; gap: 8px; padding: 0 8px 18px; }
+  .brand-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
+  .brand-name { font-size: 13.5px; font-weight: 700; letter-spacing: -0.01em; }
+  .nav-label { font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em;
+               color: var(--faint); padding: 4px 8px 6px; }
+  .nav-item {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    width: 100%; padding: 6px 8px; border-radius: 6px; border: none; background: none;
+    font: inherit; font-size: 12.5px; color: var(--text); text-align: left; cursor: pointer;
+  }
+  .nav-item:hover { background: var(--grid-line); }
+  .nav-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+  .nav-val { font-size: 11px; color: var(--muted); }
+
+  /* --- Main --- */
+  .main { flex: 1; min-width: 0; padding: 24px 28px 56px; }
+  .topbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
+  h1 { font-size: 19px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { font-size: 12.5px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .sub a { color: var(--accent-text); text-decoration: none; }
+  .sub a:hover { text-decoration: underline; }
+  .live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--positive); position: relative; flex-shrink: 0; }
+  .live-dot::after {
+    content: ""; position: absolute; inset: -3px; border-radius: 50%; border: 1px solid var(--positive);
+    animation: pulse 2s ease-out infinite;
+  }
+  @keyframes pulse { 0% { transform: scale(.6); opacity: .8; } 100% { transform: scale(1.8); opacity: 0; } }
+  @media (prefers-reduced-motion: reduce) { .live-dot::after { animation: none; } }
+
+  .tabs { display: flex; gap: 6px; }
+  .tab {
+    font: inherit; font-size: 12.5px; font-weight: 600; padding: 6px 14px; border-radius: 7px;
+    border: 1px solid var(--border); background: var(--surface); color: var(--text); cursor: pointer;
+  }
+  .tab[aria-selected="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+  /* --- KPI strip --- */
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin-bottom: 22px; }
+  .kpi { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+  .kpi-label { font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--faint); margin-bottom: 5px; }
+  .kpi-val { font-size: 17px; font-weight: 700; letter-spacing: -0.01em; }
+  .kpi-val.positive { color: var(--positive); }
+  .kpi-val.negative { color: var(--negative); }
+  .kpi-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+  .note { font-size: 12px; color: var(--muted); margin: 0 0 16px; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+  .panel {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 13px 13px 9px; scroll-margin-top: 16px; transition: border-color .15s;
+  }
+  .panel.flash { border-color: var(--accent); }
+  .panel-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 5px; }
+  .code { font-size: 13px; font-weight: 700; }
+  .val { font-size: 12.5px; font-weight: 700; }
+  .chart-box { height: 138px; position: relative; }
+
+  @media (max-width: 720px) {
+    .sidebar { display: none; }
+    .main { padding: 18px 16px 40px; }
+  }
+</style>
+</head>
+<body>
+<div class="shell">
+  <nav class="sidebar" id="sidebar">
+    <div class="brand"><span class="brand-dot"></span><span class="brand-name">T\u1ef7 gi\u00e1 VND</span></div>
+    <div class="nav-label">Danh s\u00e1ch theo d\u00f5i</div>
+    <div id="navList"></div>
+  </nav>
+  <main class="main">
+    <div class="topbar">
+      <div>
+        <h1>T\u1ef7 gi\u00e1 quy \u0111\u1ed5i sang VND</h1>
+        <div class="sub"><span class="live-dot"></span> C\u1eadp nh\u1eadt l\u00fac __GENERATED_AT__ &middot; <a href="__REPO_URL__">m\u00e3 ngu\u1ed3n</a></div>
+      </div>
+      <div class="tabs" role="tablist" id="tabs"></div>
+    </div>
+
+    <div class="kpis" id="kpis"></div>
+    <div class="note" id="rangeNote"></div>
+    <div class="grid" id="grid"></div>
+  </main>
+</div>
+<script>
+const DATA = __DATA_JSON__;
+const COLORS = __COLORS_JSON__;
+const WATCHLIST = __WATCHLIST_JSON__;
+const RANGES = __RANGES_JSON__;
+
+const grid = document.getElementById('grid');
+const tabsEl = document.getElementById('tabs');
+const noteEl = document.getElementById('rangeNote');
+const kpisEl = document.getElementById('kpis');
+const navListEl = document.getElementById('navList');
+let activeCharts = [];
+const fmt = (v) => v.toLocaleString('vi-VN', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const fmtPct = (v) => (v > 0 ? '+' : '') + v.toFixed(2) + '%';
+
+function renderRange(key) {
+  activeCharts.forEach(c => c.destroy());
+  activeCharts = [];
+  grid.innerHTML = '';
+  navListEl.innerHTML = '';
+  kpisEl.innerHTML = '';
+
+  const rangeData = DATA[key] || {};
+  const codes = WATCHLIST.filter(c => rangeData[c] && rangeData[c].length >= 2);
+  if (codes.length === 0) {
+    noteEl.textContent = 'Ch\u01b0a \u0111\u1ee7 d\u1eef li\u1ec7u l\u1ecbch s\u1eed cho kho\u1ea3ng n\u00e0y \u2014 s\u1ebd hi\u1ec3n th\u1ecb khi \u0111\u00e3 t\u00edch l\u0169y \u0111\u1ee7.';
+    return;
+  }
+  noteEl.textContent = '';
+
+  // Derive KPIs from this range's actual data: first vs last point per currency.
+  const changes = codes.map(code => {
+    const pts = rangeData[code];
+    const first = pts[0][1], last = pts[pts.length - 1][1];
+    return { code, last, pct: ((last - first) / first) * 100 };
+  });
+  const gainer = changes.reduce((a, b) => (b.pct > a.pct ? b : a));
+  const loser = changes.reduce((a, b) => (b.pct < a.pct ? b : a));
+  const mostStable = changes.reduce((a, b) => (Math.abs(b.pct) < Math.abs(a.pct) ? b : a));
+
+  const kpiHtml = (label, code, pctVal, cls) => `
+    <div class="kpi"><div class="kpi-label">${label}</div>
+      <div class="kpi-val mono ${cls}">${code}</div>
+      <div class="kpi-sub mono">${fmtPct(pctVal)}</div></div>`;
+  kpisEl.innerHTML =
+    `<div class="kpi"><div class="kpi-label">\u0110ang theo d\u00f5i</div><div class="kpi-val mono">${codes.length}</div>
+      <div class="kpi-sub">lo\u1ea1i ti\u1ec1n</div></div>` +
+    kpiHtml('T\u0103ng m\u1ea1nh nh\u1ea5t', gainer.code, gainer.pct, 'positive') +
+    kpiHtml('Gi\u1ea3m m\u1ea1nh nh\u1ea5t', loser.code, loser.pct, 'negative') +
+    kpiHtml('\u1ed4n \u0111\u1ecbnh nh\u1ea5t', mostStable.code, mostStable.pct, '');
+
+  for (const code of codes) {
+    const points = rangeData[code].map(([t, v]) => ({x: t, y: v}));
+    const last = points[points.length - 1].y;
+    const color = COLORS[code] || '#2563eb';
+
+    // Sidebar nav entry - jumps to and briefly highlights the matching card.
+    const navBtn = document.createElement('button');
+    navBtn.className = 'nav-item';
+    navBtn.innerHTML = `<span style="display:flex;align-items:center;gap:7px;">
+      <span class="nav-dot" style="background:${color}"></span>${code}</span>
+      <span class="nav-val mono">${fmt(last)}</span>`;
+    navBtn.addEventListener('click', () => {
+      const target = document.getElementById('panel-' + code);
+      target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      target.classList.add('flash');
+      setTimeout(() => target.classList.remove('flash'), 900);
+    });
+    navListEl.appendChild(navBtn);
+
+    const panel = document.createElement('div');
+    panel.className = 'panel';
+    panel.id = 'panel-' + code;
+    panel.innerHTML = `<div class="panel-head"><span class="code">${code}</span>
+      <span class="val mono" style="color:${color}">${fmt(last)}</span></div>
+      <div class="chart-box"><canvas></canvas></div>`;
+    grid.appendChild(panel);
+
+    const ctx = panel.querySelector('canvas');
+    activeCharts.push(new Chart(ctx, {
+      type: 'line',
+      data: { datasets: [{ data: points, borderColor: color, borderWidth: 1.6,
+        pointRadius: 0, pointHoverRadius: 4, pointHoverBackgroundColor: color, tension: 0.15 }] },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        interaction: { mode: 'nearest', intersect: false, axis: 'x' },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              title: (items) => new Date(items[0].parsed.x).toLocaleString('vi-VN'),
+              label: (item) => fmt(item.parsed.y) + ' VND',
+            }
+          }
+        },
+        scales: {
+          x: { type: 'time', grid: { display: false }, ticks: { maxTicksLimit: 4, font: { size: 9 } } },
+          y: { grid: { color: getComputedStyle(document.documentElement).getPropertyValue('--grid-line') },
+               ticks: { maxTicksLimit: 4, font: { size: 9 },
+                        callback: (v) => v.toLocaleString('vi-VN') } }
+        }
+      }
+    }));
+  }
+}
+
+RANGES.forEach(([key, label], i) => {
+  const btn = document.createElement('button');
+  btn.className = 'tab'; btn.textContent = label; btn.setAttribute('role', 'tab');
+  btn.setAttribute('aria-selected', i === 0 ? 'true' : 'false');
+  btn.addEventListener('click', () => {
+    tabsEl.querySelectorAll('.tab').forEach(t => t.setAttribute('aria-selected', 'false'));
+    btn.setAttribute('aria-selected', 'true');
+    renderRange(key);
+  });
+  tabsEl.appendChild(btn);
+});
+
+renderRange(RANGES[0][0]);
+</script>
+</body>
+</html>
+"""
+
+
+def generate_interactive_dashboard(current_rates):
+    """Writes docs/index.html: an interactive version of the rate charts
+    with real mouse-hover tooltips (via Chart.js) showing the exact rate at
+    any point on the line. This is a real webpage with real JavaScript, not
+    something embedded in the email — email clients run no JavaScript at
+    all, and an HTML-image-map approach (no JS, no CSS, just a native
+    title-attribute tooltip) tested correctly in every controlled test here
+    but did not actually work in the user's real Gmail on two separate
+    attempts, despite caniemail.com listing image maps as Gmail-supported.
+    A real webpage sidesteps the question entirely: Chart.js's hover
+    tooltips are standard, well-supported browser behavior, not an email
+    rendering gamble.
+
+    Requires GitHub Pages enabled on the repo (Settings > Pages > Deploy
+    from a branch > main > /docs) — something only the repo owner can do,
+    not this script. Returns the path written, or None if there's no
+    history to plot yet.
+    """
+    history_rows = _read_history_rows()
+    if current_rates:
+        ts = now_vn()
+        history_rows = history_rows + [(ts, code, rate) for code, rate in current_rates.items()]
+
+    payload = {}
+    for key, days, _label in CHART_SPECS:
+        cutoff = now_vn() - timedelta(days=days)
+        by_code = {}
+        for ts, code, rate in history_rows:
+            if code not in CHART_CURRENCIES or ts < cutoff:
+                continue
+            by_code.setdefault(code, []).append((ts, rate))
+        range_payload = {}
+        for code, points in by_code.items():
+            points.sort(key=lambda p: p[0])
+            if len(points) < 2:
+                continue
+            range_payload[code] = [
+                [ts.isoformat(), round(rate, 4)] for ts, rate in _downsample(points)
+            ]
+        payload[key] = range_payload
+
+    if not any(payload.values()):
+        return None
+
+    repo_url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}" if os.environ.get("GITHUB_REPOSITORY") else "#"
+    html = (
+        _DASHBOARD_TEMPLATE
+        .replace("__DATA_JSON__", json.dumps(payload, ensure_ascii=False))
+        .replace("__COLORS_JSON__", json.dumps(CURRENCY_DOT_COLORS, ensure_ascii=False))
+        .replace("__WATCHLIST_JSON__", json.dumps(WATCHLIST, ensure_ascii=False))
+        .replace("__RANGES_JSON__", json.dumps([[k, l] for k, _d, l in CHART_SPECS], ensure_ascii=False))
+        .replace("__GENERATED_AT__", now_vn().strftime("%d/%m/%Y %H:%M"))
+        .replace("__REPO_URL__", repo_url)
+    )
+    os.makedirs("docs", exist_ok=True)
+    path = os.path.join("docs", "index.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return path
 
 
 # --- Best-rate + discrepancy analysis ----------------------------------------
@@ -1644,49 +1893,10 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
                 f'<div style="font-size:13px;font-weight:700;color:{C["text"]};margin:14px 0 6px;">{_html_escape(r["label"])}</div>'
             )
             if r["ok"] and CHART_BASE_URL:
-                interactive = r["key"] in INTERACTIVE_CHART_RANGES
-                map_name = f"chart-map-{r['key']}"
-                if interactive:
-                    # Fixed, unscaled size: testing showed <area coords> do NOT
-                    # follow a resized image — neither CSS width:100% nor an HTML
-                    # width attribute rescales them (this is a documented HTML
-                    # limitation; the standard fix is JavaScript recomputing
-                    # coords on resize, not available in email). So this image is
-                    # rendered directly at the size it's displayed at, sized to
-                    # fit inside the card's content width (see
-                    # INTERACTIVE_CHART_PANEL_SIZE_IN), rather than scaled via CSS.
-                    img_size_attrs = f'width="{r["width_px"]}" height="{r["height_px"]}"'
-                    img_style = f'display:block;border-radius:6px;border:1px solid {C["border"]};'
-                    usemap_attr = f'usemap="#{map_name}" '
-                else:
-                    img_size_attrs = 'width="600"'
-                    img_style = f'width:100%;max-width:600px;height:auto;display:block;border-radius:6px;border:1px solid {C["border"]};'
-                    usemap_attr = ""
                 blocks.append(
-                    f'<img src="{_chart_image_url(r["key"], cache_bust)}" {img_size_attrs} '
-                    f'{usemap_attr}alt="Biểu đồ tỷ giá {_html_escape(r["label"])}" '
-                    f'style="{img_style}">'
+                    f'<img src="{_chart_image_url(r["key"], cache_bust)}" width="600" alt="Biểu đồ tỷ giá {_html_escape(r["label"])}" '
+                    f'style="width:100%;max-width:600px;height:auto;display:block;border-radius:6px;border:1px solid {C["border"]};">'
                 )
-                if interactive:
-                    # A plain HTML image map: hovering an <area> shows the browser's
-                    # native title tooltip with the exact value at that point. No CSS
-                    # or JS involved — Gmail strips <style> blocks entirely and
-                    # disallows absolute positioning, which rules out both a CSS-only
-                    # :hover tooltip and a JS one, but caniemail.com lists plain image
-                    # maps as supported in Gmail. Coordinates are in the saved PNG's
-                    # native pixel size, matching the img width/height above exactly
-                    # (unscaled) — see the note above on why this can't be responsive.
-                    # Each area is a full-panel-height vertical strip rather than a
-                    # small target at the exact point — much more forgiving to hover,
-                    # since a tight hit region is easy to miss entirely (which looks
-                    # identical to the feature not working) and native title tooltips
-                    # already require a steady ~1s hover to appear at all.
-                    areas_html = "".join(
-                        f'<area shape="rect" coords="{a["coords"]}" '
-                        f'title="{_html_escape(a["title"]).replace(chr(34), "&quot;")}" href="#">'
-                        for a in r["areas"]
-                    )
-                    blocks.append(f'<map name="{map_name}">{areas_html}</map>')
                 if r["coverage_days"] < r["days"] - 1:
                     blocks.append(
                         f'<div class="crx-muted" style="font-size:11.5px;color:{C["muted"]};margin-top:4px;">'
@@ -1704,6 +1914,17 @@ def format_email_html(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_ra
                     f'<div class="crx-muted" style="font-size:12.5px;color:{C["muted"]};">'
                     f'Chưa đủ dữ liệu lịch sử cho khoảng {_html_escape(r["label"])} — sẽ hiển thị khi đã tích lũy đủ.</div>'
                 )
+        # Hovering the static images above can't show exact values — email
+        # clients run no JavaScript, and two attempts at a JS-free HTML image
+        # map (native title tooltips) tested correctly here but did not
+        # actually work in the user's real Gmail. A real webpage doesn't have
+        # that constraint, so that's where genuine hover-for-value lives.
+        if DASHBOARD_URL:
+            blocks.append(
+                f'<a href="{_html_escape(DASHBOARD_URL)}" '
+                f'style="display:inline-block;margin-top:14px;font-size:13px;font-weight:600;color:{chart_accent};">'
+                f'Xem biểu đồ tương tác (di chuột để xem tỷ giá) \u2192</a>'
+            )
         parts.append(_html_card(
             "Biểu đồ tỷ giá theo thời gian", "".join(blocks),
             f"Tính theo lịch sử {_html_escape(SOURCES[0][0])}, ghi lại mỗi lần chạy",
@@ -1879,6 +2100,7 @@ def cmd_generate():
     # Rendered from rate_history.csv plus this run's not-yet-saved rates, so the
     # charts stay in sync with the rate table below rather than lagging one run.
     chart_results = generate_rate_charts(rates)
+    generate_interactive_dashboard(rates)
 
     body = format_email_body(rates, vcb_rates, fawaz_rates, fxrates_rates, coingecko_rates, previous_rates,
                               vcb_error, fawaz_error, fxrates_error, coingecko_error, market_error,
